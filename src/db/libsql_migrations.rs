@@ -725,8 +725,6 @@ FROM wasm_channels_old;
 
 DROP TABLE wasm_channels_old;
 
-INSERT INTO _migrations (version, name) VALUES (10, 'wasm_wit_default_0_3_0');
-
 COMMIT;
 PRAGMA foreign_keys=ON;
 PRAGMA legacy_alter_table=OFF;
@@ -811,13 +809,32 @@ async fn apply_non_transactional_migration(
     use crate::error::DatabaseError;
 
     if let Err(e) = conn.execute_batch(sql).await {
-        let _ = conn
+        if let Err(cleanup_error) = conn
             .execute_batch("ROLLBACK; PRAGMA foreign_keys=ON; PRAGMA legacy_alter_table=OFF;")
-            .await;
+            .await
+        {
+            tracing::warn!(
+                version,
+                name,
+                error = %cleanup_error,
+                "libSQL non-transactional migration cleanup failed"
+            );
+        }
         return Err(DatabaseError::Migration(format!(
             "libSQL migration V{version} ({name}) failed: {e}"
         )));
     }
+
+    conn.execute(
+        "INSERT INTO _migrations (version, name) VALUES (?1, ?2)",
+        libsql::params![version, name],
+    )
+    .await
+    .map_err(|e| {
+        DatabaseError::Migration(format!(
+            "Failed to record non-transactional migration V{version} ({name}): {e}"
+        ))
+    })?;
 
     Ok(())
 }
@@ -854,6 +871,10 @@ mod tests {
         assert!(
             !sql.contains("wit_version TEXT NOT NULL DEFAULT '0.1.0'"),
             "expected V10 libSQL migration to remove stale 0.1.0 wit_version defaults"
+        );
+        assert!(
+            !sql.contains("INSERT INTO _migrations"),
+            "non-transactional migration SQL should not manage _migrations rows itself"
         );
     }
 }
