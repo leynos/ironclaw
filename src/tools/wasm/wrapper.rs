@@ -567,6 +567,26 @@ impl WasmToolWrapper {
         Ok(())
     }
 
+    /// Recover the guest-exported description and parameter schema.
+    ///
+    /// This runs after the wrapper has been fully configured so metadata
+    /// extraction uses the same linker, limits, and host wiring as real
+    /// execution. Registration uses this to replace the compile-time
+    /// placeholder metadata for file-loaded WASM tools before they are exposed
+    /// through `ToolRegistry::tool_definitions()`.
+    ///
+    /// # Returns
+    ///
+    /// Returns the guest-exported `(description, schema)` pair.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let wrapper = WasmToolWrapper::new(runtime, prepared, Capabilities::default());
+    /// let (description, schema) = wrapper.exported_metadata()?;
+    /// assert!(!description.is_empty());
+    /// assert_eq!(schema["type"], serde_json::json!("object"));
+    /// ```
     pub(crate) fn exported_metadata(&self) -> Result<(String, serde_json::Value), WasmError> {
         let engine = self.runtime.engine();
         let limits = &self.prepared.limits;
@@ -623,6 +643,7 @@ impl WasmToolWrapper {
         }
     }
 
+    /// Read metadata directly from the guest's `description()` and `schema()` exports.
     fn read_metadata_exports(
         tool_iface: &wit_tool::Guest,
         store: &mut Store<StoreData>,
@@ -638,6 +659,7 @@ impl WasmToolWrapper {
         Ok((description, schema))
     }
 
+    /// Recover metadata by provoking a guest error and parsing the retry hint.
     fn read_metadata_via_error_hint(
         tool_iface: &wit_tool::Guest,
         store: &mut Store<StoreData>,
@@ -808,6 +830,7 @@ fn build_tool_hint(tool_iface: &wit_tool::Guest, store: &mut Store<StoreData>) -
     hint
 }
 
+/// Parse a wrapper retry hint into a `(description, schema)` pair.
 fn parse_tool_hint(hint: &str) -> Option<(String, serde_json::Value)> {
     let desc_prefix = "Description: ";
     let schema_prefix = "Parameters schema: ";
