@@ -738,6 +738,35 @@ mod tests {
     use super::*;
     use crate::tools::registry::EchoTool;
 
+    fn test_extension_manager() -> Arc<ExtensionManager> {
+        use crate::secrets::{InMemorySecretsStore, SecretsCrypto};
+        use crate::tools::mcp::session::McpSessionManager;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let tools_dir = dir.path().join("tools");
+        let channels_dir = dir.path().join("channels");
+        std::fs::create_dir_all(&tools_dir).expect("create tools dir");
+        std::fs::create_dir_all(&channels_dir).expect("create channels dir");
+
+        let master_key =
+            secrecy::SecretString::from("0123456789abcdef0123456789abcdef".to_string());
+        let crypto = Arc::new(SecretsCrypto::new(master_key).expect("crypto"));
+
+        Arc::new(ExtensionManager::new(
+            Arc::new(McpSessionManager::new()),
+            Arc::new(InMemorySecretsStore::new(crypto)),
+            Arc::new(ToolRegistry::new()),
+            None,
+            None,
+            tools_dir,
+            channels_dir,
+            None,
+            "test".to_string(),
+            None,
+            Vec::new(),
+        ))
+    }
+
     #[tokio::test]
     async fn test_register_and_get() {
         let registry = ToolRegistry::new();
@@ -922,5 +951,28 @@ mod tests {
         registry.retain_only(&[]).await;
         let after = registry.list().await.len();
         assert_eq!(before, after);
+    }
+
+    #[tokio::test]
+    async fn test_register_extension_tools_registers_expected_names() {
+        let registry = ToolRegistry::new();
+        registry.register_extension_tools(test_extension_manager());
+
+        let mut names = registry.list().await;
+        names.sort();
+
+        assert_eq!(
+            names,
+            vec![
+                "extension_info",
+                "tool_activate",
+                "tool_auth",
+                "tool_install",
+                "tool_list",
+                "tool_remove",
+                "tool_search",
+                "tool_upgrade",
+            ]
+        );
     }
 }
