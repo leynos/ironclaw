@@ -310,7 +310,7 @@ CREATE TABLE IF NOT EXISTS wasm_tools (
     user_id TEXT NOT NULL,
     name TEXT NOT NULL,
     version TEXT NOT NULL DEFAULT '1.0.0',
-    wit_version TEXT NOT NULL DEFAULT '0.1.0',
+    wit_version TEXT NOT NULL DEFAULT '0.3.0',
     description TEXT NOT NULL,
     wasm_binary BLOB NOT NULL,
     binary_hash BLOB NOT NULL,
@@ -334,7 +334,7 @@ CREATE TABLE IF NOT EXISTS wasm_channels (
     user_id TEXT NOT NULL,
     name TEXT NOT NULL,
     version TEXT NOT NULL DEFAULT '0.1.0',
-    wit_version TEXT NOT NULL DEFAULT '0.1.0',
+    wit_version TEXT NOT NULL DEFAULT '0.3.0',
     description TEXT NOT NULL DEFAULT '',
     wasm_binary BLOB NOT NULL,
     binary_hash BLOB NOT NULL,
@@ -583,20 +583,21 @@ INSERT OR IGNORE INTO leak_detection_patterns (id, name, pattern, severity, acti
 ///
 /// Each entry is `(version, name, sql)`. Migrations are idempotent: the
 /// `_migrations` table tracks which versions have been applied.
-pub const INCREMENTAL_MIGRATIONS: &[(i64, &str, &str)] = &[(
-    9,
-    "flexible_embedding_dimension",
-    // Rebuild memory_chunks to remove the fixed F32_BLOB(1536) type
-    // constraint so any embedding dimension works. Existing embeddings
-    // are preserved; users only need to re-embed if they change models.
-    //
-    // The vector index (libsql_vector_idx) requires a fixed-dimension
-    // F32_BLOB(N), so we drop it entirely. Vector search falls back to
-    // brute-force cosine distance which is fast enough for personal
-    // assistant workspaces. This matches PostgreSQL after its V9 migration.
-    //
-    // SQLite cannot ALTER COLUMN types, so we recreate the table.
-    r#"
+pub const INCREMENTAL_MIGRATIONS: &[(i64, &str, &str)] = &[
+    (
+        9,
+        "flexible_embedding_dimension",
+        // Rebuild memory_chunks to remove the fixed F32_BLOB(1536) type
+        // constraint so any embedding dimension works. Existing embeddings
+        // are preserved; users only need to re-embed if they change models.
+        //
+        // The vector index (libsql_vector_idx) requires a fixed-dimension
+        // F32_BLOB(N), so we drop it entirely. Vector search falls back to
+        // brute-force cosine distance which is fast enough for personal
+        // assistant workspaces. This matches PostgreSQL after its V9 migration.
+        //
+        // SQLite cannot ALTER COLUMN types, so we recreate the table.
+        r#"
 -- Drop vector index (requires fixed F32_BLOB(N), incompatible with flexible dimensions)
 DROP INDEX IF EXISTS idx_memory_chunks_embedding;
 
@@ -644,7 +645,94 @@ CREATE TRIGGER IF NOT EXISTS memory_chunks_fts_update AFTER UPDATE ON memory_chu
     INSERT INTO memory_chunks_fts(rowid, content) VALUES (new._rowid, new.content);
 END;
 "#,
-)];
+    ),
+    (
+        10,
+        "wasm_wit_default_0_3_0",
+        // Update existing databases that still default newly inserted wasm tool
+        // and channel rows to the historical 0.1.0 WIT version. This rebuilds
+        // the affected tables because SQLite cannot ALTER COLUMN defaults.
+        //
+        // `legacy_alter_table=ON` is required so child foreign keys keep pointing
+        // at `wasm_tools` while we rename the old table out of the way.
+        r#"
+PRAGMA legacy_alter_table=ON;
+PRAGMA foreign_keys=OFF;
+BEGIN IMMEDIATE;
+
+ALTER TABLE wasm_tools RENAME TO wasm_tools_old;
+
+CREATE TABLE wasm_tools (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    version TEXT NOT NULL DEFAULT '1.0.0',
+    wit_version TEXT NOT NULL DEFAULT '0.3.0',
+    description TEXT NOT NULL,
+    wasm_binary BLOB NOT NULL,
+    binary_hash BLOB NOT NULL,
+    parameters_schema TEXT NOT NULL,
+    source_url TEXT,
+    trust_level TEXT NOT NULL DEFAULT 'user',
+    status TEXT NOT NULL DEFAULT 'active',
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    UNIQUE (user_id, name, version)
+);
+
+INSERT INTO wasm_tools (
+    id, user_id, name, version, wit_version, description, wasm_binary, binary_hash,
+    parameters_schema, source_url, trust_level, status, created_at, updated_at
+)
+SELECT
+    id, user_id, name, version, wit_version, description, wasm_binary, binary_hash,
+    parameters_schema, source_url, trust_level, status, created_at, updated_at
+FROM wasm_tools_old;
+
+DROP TABLE wasm_tools_old;
+
+CREATE INDEX IF NOT EXISTS idx_wasm_tools_user ON wasm_tools(user_id);
+CREATE INDEX IF NOT EXISTS idx_wasm_tools_name ON wasm_tools(user_id, name);
+CREATE INDEX IF NOT EXISTS idx_wasm_tools_status ON wasm_tools(status);
+CREATE INDEX IF NOT EXISTS idx_wasm_tools_trust ON wasm_tools(trust_level);
+
+ALTER TABLE wasm_channels RENAME TO wasm_channels_old;
+
+CREATE TABLE wasm_channels (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    version TEXT NOT NULL DEFAULT '0.1.0',
+    wit_version TEXT NOT NULL DEFAULT '0.3.0',
+    description TEXT NOT NULL DEFAULT '',
+    wasm_binary BLOB NOT NULL,
+    binary_hash BLOB NOT NULL,
+    capabilities_json TEXT NOT NULL DEFAULT '{}',
+    status TEXT NOT NULL DEFAULT 'active',
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    UNIQUE (user_id, name)
+);
+
+INSERT INTO wasm_channels (
+    id, user_id, name, version, wit_version, description, wasm_binary, binary_hash,
+    capabilities_json, status, created_at, updated_at
+)
+SELECT
+    id, user_id, name, version, wit_version, description, wasm_binary, binary_hash,
+    capabilities_json, status, created_at, updated_at
+FROM wasm_channels_old;
+
+DROP TABLE wasm_channels_old;
+
+INSERT INTO _migrations (version, name) VALUES (10, 'wasm_wit_default_0_3_0');
+
+COMMIT;
+PRAGMA foreign_keys=ON;
+PRAGMA legacy_alter_table=OFF;
+"#,
+    ),
+];
 
 /// Run incremental migrations that haven't been applied yet.
 ///
@@ -670,6 +758,12 @@ pub async fn run_incremental(conn: &libsql::Connection) -> Result<(), crate::err
         }
 
         tracing::info!(version, name, "libSQL: applying incremental migration");
+
+        if version == 10 {
+            apply_non_transactional_migration(conn, version, name, sql).await?;
+            tracing::info!(version, name, "libSQL: migration applied successfully");
+            continue;
+        }
 
         // Wrap migration + recording in a transaction for atomicity.
         // If the process crashes mid-migration, the transaction rolls back
@@ -706,4 +800,60 @@ pub async fn run_incremental(conn: &libsql::Connection) -> Result<(), crate::err
     }
 
     Ok(())
+}
+
+async fn apply_non_transactional_migration(
+    conn: &libsql::Connection,
+    version: i64,
+    name: &str,
+    sql: &str,
+) -> Result<(), crate::error::DatabaseError> {
+    use crate::error::DatabaseError;
+
+    if let Err(e) = conn.execute_batch(sql).await {
+        let _ = conn
+            .execute_batch("ROLLBACK; PRAGMA foreign_keys=ON; PRAGMA legacy_alter_table=OFF;")
+            .await;
+        return Err(DatabaseError::Migration(format!(
+            "libSQL migration V{version} ({name}) failed: {e}"
+        )));
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{INCREMENTAL_MIGRATIONS, SCHEMA};
+
+    #[test]
+    fn schema_uses_current_wit_defaults_for_new_wasm_records() {
+        let expected = "wit_version TEXT NOT NULL DEFAULT '0.3.0'";
+        let count = SCHEMA.matches(expected).count();
+        assert_eq!(
+            count, 2,
+            "expected fresh libSQL schema to declare {expected} for both wasm tables"
+        );
+        assert!(
+            !SCHEMA.contains("wit_version TEXT NOT NULL DEFAULT '0.1.0'"),
+            "fresh libSQL schema should not default new wasm records to the historical 0.1.0 WIT version"
+        );
+    }
+
+    #[test]
+    fn incremental_migrations_upgrade_existing_wasm_wit_defaults_to_0_3_0() {
+        let (_, _, sql) = INCREMENTAL_MIGRATIONS
+            .iter()
+            .find(|(version, _, _)| *version == 10)
+            .expect("expected a V10 libSQL migration for stale wasm wit_version defaults");
+
+        assert!(
+            sql.contains("0.3.0"),
+            "expected V10 libSQL migration to set wasm wit_version defaults to 0.3.0"
+        );
+        assert!(
+            !sql.contains("wit_version TEXT NOT NULL DEFAULT '0.1.0'"),
+            "expected V10 libSQL migration to remove stale 0.1.0 wit_version defaults"
+        );
+    }
 }
