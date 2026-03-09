@@ -3,7 +3,8 @@
 //! When `ironclaw worker` is invoked, the binary starts in worker mode:
 //! - Connects to the orchestrator over HTTP
 //! - Uses a `ProxyLlmProvider` that routes LLM calls through the orchestrator
-//! - Runs container-safe tools plus orchestrator-backed extension-management tools
+//! - Runs container-safe tools plus orchestrator-backed non-mutating
+//!   extension-management tools
 //! - Reports status and completion back to the orchestrator
 //!
 //! ```text

@@ -1,3 +1,9 @@
+//! Worker-local proxies for safe extension-management reads and activation.
+//!
+//! Hosted workers cannot consume interactive approval grants, so this module
+//! only exposes the non-mutating extension tools that can be proxied through
+//! the orchestrator without bypassing approval checks.
+
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -57,7 +63,7 @@ pub(crate) fn register_worker_extension_proxy_tools(
     registry: &ToolRegistry,
     client: Arc<WorkerHttpClient>,
 ) {
-    for kind in ExtensionToolKind::ALL {
+    for kind in ExtensionToolKind::HOSTED_WORKER_PROXY_SAFE {
         registry.register_sync(Arc::new(WorkerExtensionProxyTool::new(
             kind,
             Arc::clone(&client),
@@ -132,5 +138,30 @@ mod tests {
 
         server.abort();
         let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn register_worker_extension_proxy_tools_excludes_approval_gated_tools() {
+        let client = Arc::new(WorkerHttpClient::new(
+            "http://127.0.0.1:1".to_string(),
+            Uuid::new_v4(),
+            "test-token".to_string(),
+        ));
+        let registry = ToolRegistry::new();
+
+        register_worker_extension_proxy_tools(&registry, client);
+
+        let mut names = registry.list().await;
+        names.sort();
+
+        assert_eq!(
+            names,
+            vec![
+                "extension_info",
+                "tool_activate",
+                "tool_list",
+                "tool_search"
+            ]
+        );
     }
 }

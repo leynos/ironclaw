@@ -599,12 +599,8 @@ mod tests {
             "read_file",
             "shell",
             "tool_activate",
-            "tool_auth",
-            "tool_install",
             "tool_list",
-            "tool_remove",
             "tool_search",
-            "tool_upgrade",
             "extension_info",
             "write_file",
         ] {
@@ -635,5 +631,10 @@ mod tests {
         assert!(names.contains(&"tool_list"));
         assert!(names.contains(&"tool_search"));
         assert!(names.contains(&"tool_activate"));
+        assert!(names.contains(&"extension_info"));
+        assert!(!names.contains(&"tool_install"));
+        assert!(!names.contains(&"tool_auth"));
+        assert!(!names.contains(&"tool_remove"));
+        assert!(!names.contains(&"tool_upgrade"));
     }
 }
