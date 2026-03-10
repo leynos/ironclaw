@@ -757,6 +757,9 @@ pub async fn run_incremental(conn: &libsql::Connection) -> Result<(), crate::err
 
         tracing::info!(version, name, "libSQL: applying incremental migration");
 
+        // V10 contains its own `BEGIN IMMEDIATE`/`COMMIT` block and sets
+        // PRAGMAs that must execute outside a transaction, so bypass the
+        // outer transaction wrapper.
         if version == 10 {
             apply_non_transactional_migration(conn, version, name, sql).await?;
             tracing::info!(version, name, "libSQL: migration applied successfully");
