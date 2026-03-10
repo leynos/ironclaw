@@ -245,8 +245,8 @@ impl StoreData {
             .map_err(|e| format!("Rate limit exceeded: {}", e))?;
 
         // Parse headers and inject credentials into header values
-        let raw_headers: HashMap<String, String> =
-            serde_json::from_str(headers_json).unwrap_or_default();
+        let raw_headers: HashMap<String, String> = serde_json::from_str(headers_json)
+            .map_err(|e| format!("Invalid HTTP headers JSON: {e}"))?;
 
         let mut headers: HashMap<String, String> = raw_headers
             .into_iter()
@@ -1436,6 +1436,32 @@ mod tests {
         assert!(err.contains("Potential secret leak blocked"));
         assert!(err.contains("header:Authorization"));
         assert!(err.contains("github_fine_grained_pat"));
+    }
+
+    #[test]
+    fn test_prepare_http_request_rejects_invalid_headers_json() {
+        use crate::tools::wasm::wrapper::StoreData;
+        use std::collections::HashMap;
+
+        let host = "api.github.invalid";
+        let mut store_data = StoreData::new(
+            1024 * 1024,
+            test_prepare_request_capabilities(host),
+            HashMap::new(),
+            Vec::new(),
+        );
+
+        let err = match store_data.prepare_http_request(
+            "GET",
+            &format!("https://{host}/repos/leynos/mxd"),
+            "{invalid",
+            None,
+        ) {
+            Ok(_) => panic!("invalid header JSON must fail deterministically"),
+            Err(err) => err,
+        };
+
+        assert!(err.contains("Invalid HTTP headers JSON"));
     }
 
     #[test]
