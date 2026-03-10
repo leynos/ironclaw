@@ -6,11 +6,14 @@
 //!
 //! See: <https://github.com/nearai/ironclaw/issues/352> (QA plan, item 1.1)
 
+mod support;
+
 use ironclaw::tools::builtin::extension_tools::ExtensionToolKind;
 use ironclaw::tools::schema_validator::validate_strict_schema;
 use ironclaw::tools::validate_tool_schema;
 use ironclaw::tools::wasm::WasmToolLoader;
 use ironclaw::tools::{Tool, ToolRegistry};
+use rstest::{fixture, rstest};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -19,7 +22,8 @@ struct ExtensionManagerFixture {
     manager: Arc<ironclaw::extensions::ExtensionManager>,
 }
 
-fn test_extension_manager() -> ExtensionManagerFixture {
+#[fixture]
+fn extension_manager_fixture() -> ExtensionManagerFixture {
     use ironclaw::secrets::{InMemorySecretsStore, SecretsCrypto};
     use ironclaw::tools::mcp::session::McpSessionManager;
 
@@ -118,11 +122,13 @@ async fn core_registration_covers_expected_tools() {
     );
 }
 
+#[rstest]
 #[tokio::test]
-async fn extension_registration_covers_expected_tools() {
-    let fixture = test_extension_manager();
+async fn extension_registration_covers_expected_tools(
+    extension_manager_fixture: ExtensionManagerFixture,
+) {
     let registry = ToolRegistry::new();
-    registry.register_extension_tools(Arc::clone(&fixture.manager));
+    registry.register_extension_tools(Arc::clone(&extension_manager_fixture.manager));
 
     let mut names = registry.list().await;
     names.sort();
@@ -139,11 +145,11 @@ async fn extension_registration_covers_expected_tools() {
     );
 }
 
+#[rstest]
 #[tokio::test]
-async fn extension_tool_schemas_are_valid() {
-    let fixture = test_extension_manager();
+async fn extension_tool_schemas_are_valid(extension_manager_fixture: ExtensionManagerFixture) {
     let registry = ToolRegistry::new();
-    registry.register_extension_tools(Arc::clone(&fixture.manager));
+    registry.register_extension_tools(Arc::clone(&extension_manager_fixture.manager));
 
     let tools = registry.all().await;
     let mut all_errors = Vec::new();
@@ -268,7 +274,7 @@ async fn file_loaded_github_wasm_tool_definitions_publish_real_schema() {
     );
 
     let registry = Arc::new(ToolRegistry::new());
-    let runtime = ironclaw::registry::artifacts::metadata_test_runtime();
+    let runtime = support::metadata_test_runtime();
     let loader = WasmToolLoader::new(runtime, Arc::clone(&registry));
 
     loader
