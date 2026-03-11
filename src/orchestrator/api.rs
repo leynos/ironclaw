@@ -253,9 +253,7 @@ async fn execute_extension_tool(
         StatusCode::BAD_GATEWAY
     })?;
 
-    Ok(Json(ProxyExtensionToolResponse {
-        result: output.result,
-    }))
+    Ok(Json(ProxyExtensionToolResponse { output }))
 }
 
 async fn report_status(
@@ -515,6 +513,7 @@ mod tests {
 
     use axum::body::Body;
     use axum::http::Request;
+    use rust_decimal::Decimal;
     use tower::ServiceExt;
     use uuid::Uuid;
 
@@ -909,7 +908,9 @@ mod tests {
                 Ok(ToolOutput::success(
                     serde_json::json!({"extensions": ["telegram"]}),
                     Duration::from_millis(5),
-                ))
+                )
+                .with_cost(Decimal::new(125, 2))
+                .with_raw("raw extension output"))
             }
         }
 
@@ -941,8 +942,14 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
 
         let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["result"]["extensions"][0], "telegram");
+        let proxy_resp: ProxyExtensionToolResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(proxy_resp.output.result["extensions"][0], "telegram");
+        assert_eq!(proxy_resp.output.cost, Some(Decimal::new(125, 2)));
+        assert_eq!(proxy_resp.output.duration, Duration::from_millis(5));
+        assert_eq!(
+            proxy_resp.output.raw.as_deref(),
+            Some("raw extension output")
+        );
         assert_eq!(*seen_job_id.lock().await, Some(job_id));
     }
 
