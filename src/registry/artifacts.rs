@@ -19,8 +19,8 @@ use tokio::fs;
 
 /// WASM target triples to search, in priority order.
 const WASM_TRIPLES: &[&str] = &[
-    "wasm32-wasip1",
     "wasm32-wasip2",
+    "wasm32-wasip1",
     "wasm32-wasi",
     "wasm32-unknown-unknown",
 ];
@@ -265,30 +265,34 @@ mod tests {
 
     #[test]
     fn test_find_wasm_artifact_not_found() {
-        let dir = TempDir::new().unwrap();
+        let dir = TempDir::new().expect("create temp dir");
         assert!(find_wasm_artifact(dir.path(), "nonexistent", "release").is_none());
     }
 
     #[test]
     fn test_find_wasm_artifact_found() {
-        let dir = TempDir::new().unwrap();
+        let dir = TempDir::new().expect("create temp dir");
         let target_base = resolve_target_dir(dir.path());
         let wasm_dir = target_base.join("wasm32-wasip2/release");
-        std::fs::create_dir_all(&wasm_dir).unwrap();
-        std::fs::File::create(wasm_dir.join("my_tool.wasm")).unwrap();
+        std::fs::create_dir_all(&wasm_dir).expect("create wasm32-wasip2 dir");
+        std::fs::File::create(wasm_dir.join("my_tool.wasm")).expect("create wasm artifact");
 
         let result = find_wasm_artifact(dir.path(), "my_tool", "release");
         assert!(result.is_some());
-        assert!(result.unwrap().ends_with("my_tool.wasm"));
+        assert!(
+            result
+                .expect("find my_tool artifact")
+                .ends_with("my_tool.wasm")
+        );
     }
 
     #[test]
     fn test_find_wasm_artifact_hyphen_to_underscore() {
-        let dir = TempDir::new().unwrap();
+        let dir = TempDir::new().expect("create temp dir");
         let target_base = resolve_target_dir(dir.path());
         let wasm_dir = target_base.join("wasm32-wasip1/release");
-        std::fs::create_dir_all(&wasm_dir).unwrap();
-        std::fs::File::create(wasm_dir.join("my_tool.wasm")).unwrap();
+        std::fs::create_dir_all(&wasm_dir).expect("create wasm32-wasip1 dir");
+        std::fs::File::create(wasm_dir.join("my_tool.wasm")).expect("create wasm artifact");
 
         // Search with hyphens, should find underscore version
         let result = find_wasm_artifact(dir.path(), "my-tool", "release");
@@ -296,12 +300,32 @@ mod tests {
     }
 
     #[test]
+    fn test_find_wasm_artifact_prefers_wasip2_over_wasip1() {
+        let dir = TempDir::new().expect("temp dir");
+        let target_base = resolve_target_dir(dir.path());
+        let wasip1_dir = target_base.join("wasm32-wasip1/release");
+        let wasip2_dir = target_base.join("wasm32-wasip2/release");
+        std::fs::create_dir_all(&wasip1_dir).expect("create wasip1 dir");
+        std::fs::create_dir_all(&wasip2_dir).expect("create wasip2 dir");
+        std::fs::File::create(wasip1_dir.join("my_tool.wasm")).expect("create wasip1 wasm");
+        std::fs::File::create(wasip2_dir.join("my_tool.wasm")).expect("create wasip2 wasm");
+
+        let result = find_wasm_artifact(dir.path(), "my_tool", "release")
+            .expect("should find wasm artifact");
+        assert!(
+            result.ends_with("wasm32-wasip2/release/my_tool.wasm"),
+            "expected wasm32-wasip2 artifact, got {}",
+            result.display()
+        );
+    }
+
+    #[test]
     fn test_find_any_wasm_artifact_found() {
-        let dir = TempDir::new().unwrap();
+        let dir = TempDir::new().expect("create temp dir");
         let target_base = resolve_target_dir(dir.path());
         let wasm_dir = target_base.join("wasm32-wasip2/release");
-        std::fs::create_dir_all(&wasm_dir).unwrap();
-        std::fs::File::create(wasm_dir.join("something.wasm")).unwrap();
+        std::fs::create_dir_all(&wasm_dir).expect("create wasm dir");
+        std::fs::File::create(wasm_dir.join("something.wasm")).expect("create wasm artifact");
 
         let result = find_any_wasm_artifact(dir.path(), "release");
         assert!(result.is_some());
@@ -309,23 +333,25 @@ mod tests {
 
     #[test]
     fn test_find_any_wasm_artifact_not_found() {
-        let dir = TempDir::new().unwrap();
+        let dir = TempDir::new().expect("create temp dir");
         assert!(find_any_wasm_artifact(dir.path(), "release").is_none());
     }
 
     #[tokio::test]
     async fn test_install_wasm_files_copies() {
-        let src_dir = TempDir::new().unwrap();
-        let target_dir = TempDir::new().unwrap();
+        let src_dir = TempDir::new().expect("create source temp dir");
+        let target_dir = TempDir::new().expect("create target temp dir");
 
         let wasm_src = src_dir.path().join("test.wasm");
         tokio::fs::write(&wasm_src, b"\0asm\x01\x00\x00\x00")
             .await
-            .unwrap();
+            .expect("write source wasm");
 
         // Create a capabilities file
         let caps_src = src_dir.path().join("mytool.capabilities.json");
-        tokio::fs::write(&caps_src, b"{}").await.unwrap();
+        tokio::fs::write(&caps_src, b"{}")
+            .await
+            .expect("write capabilities file");
 
         let result = install_wasm_files(
             &wasm_src,
@@ -337,22 +363,26 @@ mod tests {
         .await;
 
         assert!(result.is_ok());
-        let wasm_dst = result.unwrap();
+        let wasm_dst = result.expect("install wasm files");
         assert!(wasm_dst.exists());
         assert!(target_dir.path().join("mytool.capabilities.json").exists());
     }
 
     #[tokio::test]
     async fn test_install_wasm_files_refuses_overwrite() {
-        let src_dir = TempDir::new().unwrap();
-        let target_dir = TempDir::new().unwrap();
+        let src_dir = TempDir::new().expect("create source temp dir");
+        let target_dir = TempDir::new().expect("create target temp dir");
 
         let wasm_src = src_dir.path().join("test.wasm");
-        tokio::fs::write(&wasm_src, b"\0asm").await.unwrap();
+        tokio::fs::write(&wasm_src, b"\0asm")
+            .await
+            .expect("write source wasm");
 
         // Pre-create the target
         let existing = target_dir.path().join("mytool.wasm");
-        tokio::fs::write(&existing, b"existing").await.unwrap();
+        tokio::fs::write(&existing, b"existing")
+            .await
+            .expect("write existing target wasm");
 
         let result = install_wasm_files(
             &wasm_src,
@@ -369,8 +399,8 @@ mod tests {
     #[test]
     fn test_wasm_triples_order() {
         // Verify the order is as documented
-        assert_eq!(WASM_TRIPLES[0], "wasm32-wasip1");
-        assert_eq!(WASM_TRIPLES[1], "wasm32-wasip2");
+        assert_eq!(WASM_TRIPLES[0], "wasm32-wasip2");
+        assert_eq!(WASM_TRIPLES[1], "wasm32-wasip1");
         assert_eq!(WASM_TRIPLES[2], "wasm32-wasi");
         assert_eq!(WASM_TRIPLES[3], "wasm32-unknown-unknown");
     }

@@ -21,9 +21,12 @@
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use rust_decimal::Decimal;
+#[cfg(feature = "libsql")]
+use tempfile::TempDir;
 use tokio::sync::mpsc;
 
 use crate::agent::AgentDeps;
@@ -37,16 +40,30 @@ use crate::llm::{
     ToolCompletionResponse,
 };
 use crate::tools::ToolRegistry;
+use crate::tools::wasm::{ResourceLimits, WasmRuntimeConfig, WasmToolRuntime};
+
+/// Shared WASM runtime for metadata extraction and schema publication regressions.
+pub fn metadata_test_runtime() -> anyhow::Result<Arc<WasmToolRuntime>> {
+    let config = WasmRuntimeConfig {
+        default_limits: ResourceLimits::default()
+            .with_memory(8 * 1024 * 1024)
+            .with_fuel(100_000)
+            .with_timeout(Duration::from_secs(5)),
+        ..WasmRuntimeConfig::for_testing()
+    };
+    Ok(Arc::new(WasmToolRuntime::new(config)?))
+}
 
 /// Create a libSQL-backed test database in a temporary directory.
 ///
 /// Returns the database and a `TempDir` guard — the database file is
 /// deleted when the guard is dropped.
 #[cfg(feature = "libsql")]
-pub async fn test_db() -> (Arc<dyn Database>, tempfile::TempDir) {
+pub async fn test_db() -> (Arc<dyn Database>, TempDir) {
     use crate::db::libsql::LibSqlBackend;
+    use tempfile::tempdir;
 
-    let dir = tempfile::tempdir().expect("failed to create temp dir");
+    let dir = tempdir().expect("failed to create temp dir");
     let path = dir.path().join("test.db");
     let backend = LibSqlBackend::new_local(&path)
         .await
@@ -210,10 +227,19 @@ impl LlmProvider for StubLlm {
 /// # Usage
 ///
 /// ```rust,no_run
+/// use ironclaw::prelude::IncomingMessage;
+/// use ironclaw::testing::StubChannel;
+///
+/// # async fn example() {
 /// let (channel, sender) = StubChannel::new("test");
-/// sender.send(IncomingMessage::new("test", "user1", "hello")).await.unwrap();
+/// sender
+///     .send(IncomingMessage::new("test", "user1", "hello"))
+///     .await
+///     .unwrap();
 /// // ... run agent logic that calls channel.respond() ...
 /// let responses = channel.captured_responses();
+/// # let _ = responses;
+/// # }
 /// ```
 pub struct StubChannel {
     name: String,
@@ -334,7 +360,7 @@ pub struct TestHarness {
     /// Temp directory guard — keeps the test database alive. Dropped
     /// automatically when the harness goes out of scope.
     #[cfg(feature = "libsql")]
-    _temp_dir: tempfile::TempDir,
+    _temp_dir: TempDir,
 }
 
 /// Builder for constructing a [`TestHarness`] with sensible defaults.
@@ -398,10 +424,11 @@ impl TestHarnessBuilder {
         use crate::config::{SafetyConfig, SkillsConfig};
         use crate::hooks::HookRegistry;
         use crate::safety::SafetyLayer;
+        use tempfile::tempdir;
 
         let (db, temp_dir) = if let Some(db) = self.db {
             // Caller provided a DB; create a dummy temp dir to satisfy the struct.
-            let dir = tempfile::tempdir().expect("failed to create temp dir");
+            let dir = tempdir().expect("failed to create temp dir");
             (db, dir)
         } else {
             test_db().await

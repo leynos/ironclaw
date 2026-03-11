@@ -18,7 +18,7 @@ exclude = [
 
 [package]
 name = "ironclaw"
-version = "0.16.1"
+version = "0.17.0"
 edition = "2024"
 rust-version = "1.92"
 description = "Secure personal AI assistant that protects your data and expands its capabilities on the fly"
@@ -45,6 +45,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "mul
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tempfile = "3"
 
 # Database - PostgreSQL (default, feature-gated)
 deadpool-postgres = { version = "0.14", optional = true }
@@ -52,7 +53,7 @@ tokio-postgres = { version = "0.7", features = ["with-uuid-1", "with-chrono-0_4"
 postgres-types = { version = "0.2", features = ["with-serde_json-1"], optional = true }
 refinery = { version = "0.8", features = ["tokio-postgres"], optional = true }
 tokio-postgres-rustls = { version = "0.13", optional = true }
-rustls = { version = "0.23", optional = true, default-features = false }
+rustls = { version = "0.23", optional = true, default-features = false, features = ["ring"] }
 rustls-native-certs = { version = "0.8", optional = true }
 
 # Database - libSQL/Turso (optional embedded database)
@@ -189,8 +190,8 @@ tracing-test = "0.2"
 tokio-tungstenite = "0.26"
 testcontainers-modules = { version = "0.11", features = ["postgres"] }
 pretty_assertions = "1"
-tempfile = "3"
 insta = "1.46.3"
+rstest = "0.26.1"
 
 [features]
 default = ["postgres", "libsql", "html-to-markdown"]
