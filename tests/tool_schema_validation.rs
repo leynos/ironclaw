@@ -6,8 +6,9 @@
 //!
 //! See: <https://github.com/nearai/ironclaw/issues/352> (QA plan, item 1.1)
 
+use ironclaw::tools::schema_validator::validate_strict_schema;
 use ironclaw::tools::validate_tool_schema;
-use ironclaw::tools::wasm::{WasmRuntimeConfig, WasmToolLoader, WasmToolRuntime};
+use ironclaw::tools::wasm::{ResourceLimits, WasmRuntimeConfig, WasmToolLoader, WasmToolRuntime};
 use ironclaw::tools::{Tool, ToolRegistry};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -18,29 +19,9 @@ struct ExtensionManagerFixture {
     manager: Arc<ironclaw::extensions::ExtensionManager>,
 }
 
-fn github_artifact_paths() -> Option<(PathBuf, PathBuf)> {
-    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let source_dir = repo_root.join("tools-src/github");
-    let wasm_path =
-        ironclaw::registry::artifacts::find_wasm_artifact(&source_dir, "github-tool", "release")?;
-    let caps_path = source_dir.join("github-tool.capabilities.json");
-    caps_path.exists().then_some((wasm_path, caps_path))
-}
-
-fn wasm_metadata_test_runtime() -> Arc<WasmToolRuntime> {
-    let config = WasmRuntimeConfig {
-        default_limits: ironclaw::tools::wasm::ResourceLimits::default()
-            .with_memory(8 * 1024 * 1024)
-            .with_fuel(100_000)
-            .with_timeout(Duration::from_secs(5)),
-        ..WasmRuntimeConfig::for_testing()
-    };
-    Arc::new(WasmToolRuntime::new(config).expect("create wasm runtime"))
-}
-
-fn test_extension_manager() -> ExtensionManagerFixture {
+fn extension_manager_fixture() -> ExtensionManagerFixture {
     use ironclaw::secrets::{InMemorySecretsStore, SecretsCrypto};
-    use ironclaw::tools::mcp::{McpProcessManager, McpSessionManager};
+    use ironclaw::tools::mcp::session::McpSessionManager;
 
     let dir = tempfile::tempdir().expect("temp dir");
     let tools_dir = dir.path().join("tools");
@@ -55,7 +36,7 @@ fn test_extension_manager() -> ExtensionManagerFixture {
         _dir: dir,
         manager: std::sync::Arc::new(ironclaw::extensions::ExtensionManager::new(
             std::sync::Arc::new(McpSessionManager::new()),
-            std::sync::Arc::new(McpProcessManager::new()),
+            std::sync::Arc::new(ironclaw::tools::mcp::McpProcessManager::new()),
             std::sync::Arc::new(InMemorySecretsStore::new(crypto)),
             std::sync::Arc::new(ToolRegistry::new()),
             None,
@@ -68,6 +49,17 @@ fn test_extension_manager() -> ExtensionManagerFixture {
             Vec::new(),
         )),
     }
+}
+
+fn wasm_metadata_test_runtime() -> anyhow::Result<Arc<WasmToolRuntime>> {
+    let config = WasmRuntimeConfig {
+        default_limits: ResourceLimits::default()
+            .with_memory(8 * 1024 * 1024)
+            .with_fuel(100_000)
+            .with_timeout(Duration::from_secs(5)),
+        ..WasmRuntimeConfig::for_testing()
+    };
+    Ok(Arc::new(WasmToolRuntime::new(config)?))
 }
 
 /// Validate schemas of all tools registered via `register_builtin_tools()` and
@@ -140,9 +132,9 @@ async fn core_registration_covers_expected_tools() {
 
 #[tokio::test]
 async fn extension_registration_covers_expected_tools() {
-    let fixture = test_extension_manager();
+    let extension_manager_fixture = extension_manager_fixture();
     let registry = ToolRegistry::new();
-    registry.register_extension_tools(Arc::clone(&fixture.manager));
+    registry.register_extension_tools(Arc::clone(&extension_manager_fixture.manager));
 
     let mut names = registry.list().await;
     names.sort();
@@ -167,9 +159,9 @@ async fn extension_registration_covers_expected_tools() {
 
 #[tokio::test]
 async fn extension_tool_schemas_are_valid() {
-    let fixture = test_extension_manager();
+    let extension_manager_fixture = extension_manager_fixture();
     let registry = ToolRegistry::new();
-    registry.register_extension_tools(Arc::clone(&fixture.manager));
+    registry.register_extension_tools(Arc::clone(&extension_manager_fixture.manager));
 
     let tools = registry.all().await;
     let mut all_errors = Vec::new();
@@ -282,13 +274,19 @@ async fn all_core_tools_work_in_multi_thread_runtime() {
 
 #[tokio::test]
 async fn file_loaded_github_wasm_tool_definitions_publish_real_schema() {
-    let Some((wasm_path, caps_path)) = github_artifact_paths() else {
-        eprintln!("Skipping GitHub schema regression: github WASM artifact not built");
-        return;
-    };
+    let source_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tools-src/github");
+    let wasm_path =
+        ironclaw::registry::artifacts::find_wasm_artifact(&source_dir, "github-tool", "release")
+            .expect("github WASM artifact must be built for schema tests");
+    let caps_path = source_dir.join("github-tool.capabilities.json");
+    assert!(
+        caps_path.exists(),
+        "github capabilities sidecar must exist for schema tests: {}",
+        caps_path.display()
+    );
 
     let registry = Arc::new(ToolRegistry::new());
-    let runtime = wasm_metadata_test_runtime();
+    let runtime = wasm_metadata_test_runtime().expect("create metadata test runtime");
     let loader = WasmToolLoader::new(runtime, Arc::clone(&registry));
 
     loader
@@ -302,7 +300,15 @@ async fn file_loaded_github_wasm_tool_definitions_publish_real_schema() {
         .find(|def| def.name == "github")
         .expect("github tool definition");
 
+    if let Err(errors) = validate_strict_schema(&github.parameters, "github") {
+        panic!("github tool definition must satisfy strict validation: {errors:#?}");
+    }
     assert_eq!(github.parameters["type"], serde_json::json!("object"));
+    assert!(
+        github.parameters.get("oneOf").is_none(),
+        "top-level oneOf is rejected by OpenAI tool schemas: {}",
+        github.parameters
+    );
     assert!(
         github.parameters["required"]
             .as_array()
@@ -312,18 +318,19 @@ async fn file_loaded_github_wasm_tool_definitions_publish_real_schema() {
         "expected required action in tool definition: {}",
         github.parameters
     );
-    let first_variant = github.parameters["oneOf"]
-        .as_array()
-        .and_then(|variants| variants.first())
-        .expect("oneOf variants");
     assert!(
-        first_variant["properties"]["owner"].is_object(),
+        github.parameters["properties"]["owner"].is_object(),
         "expected owner property in tool definition: {}",
         github.parameters
     );
-    assert_eq!(
-        first_variant["properties"]["action"]["const"],
-        serde_json::json!("get_repo")
+    assert!(
+        github.parameters["properties"]["action"]["enum"]
+            .as_array()
+            .expect("action enum")
+            .iter()
+            .any(|value| value == "get_repo"),
+        "expected get_repo action enum in tool definition: {}",
+        github.parameters
     );
     assert!(
         github.description.contains("GitHub integration"),

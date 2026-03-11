@@ -25,8 +25,11 @@ pub mod registry;
 pub mod response_cache;
 pub mod retry;
 mod rig_adapter;
+pub(crate) mod schema_normalize;
 pub mod session;
 pub mod smart_routing;
+#[cfg(test)]
+pub(crate) mod test_fixtures;
 
 pub mod image_models;
 pub mod reasoning_models;

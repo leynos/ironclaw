@@ -1,5 +1,14 @@
+//! Placeholder metadata defaults, guest export recovery, and tool-hint helpers
+//! for WASM tool wrappers.
+//!
+//! This module centralises the metadata path used while a wrapper is being
+//! constructed: placeholder description/schema values, recovery of the guest's
+//! exported `description()` and `schema()`, and generation of compact retry
+//! hints for schema-aware failures.
+
 use wasmtime::Store;
 use wasmtime::component::Linker;
+use wasmtime_wasi::{ResourceTable, WasiCtx, WasiCtxBuilder, WasiView};
 
 use super::*;
 
@@ -25,11 +34,11 @@ const HINT_SCHEMA_MAX: usize = 3000;
 impl WasmToolWrapper {
     /// Recover the guest-exported description and parameter schema.
     ///
-    /// This method instantiates the component with the same linker, limits,
-    /// and host wiring used for normal execution, then reads the pure
-    /// `description()` and `schema()` guest exports. Registration uses the
-    /// recovered pair to replace placeholder metadata before file-loaded WASM
-    /// tools are exposed through `ToolRegistry::tool_definitions()`.
+    /// This method instantiates the component with a metadata-only host linker
+    /// and minimal store state, then reads the pure `description()` and
+    /// `schema()` guest exports. Registration uses the recovered pair to
+    /// replace placeholder metadata before file-loaded WASM tools are exposed
+    /// through `ToolRegistry::tool_definitions()`.
     ///
     /// # Returns
     ///
@@ -47,12 +56,7 @@ impl WasmToolWrapper {
         let engine = self.runtime.engine();
         let limits = &self.prepared.limits;
 
-        let store_data = StoreData::new(
-            limits.memory_bytes,
-            self.capabilities.clone(),
-            self.credentials.clone(),
-            Vec::new(),
-        );
+        let store_data = MetadataStoreData::new(limits.memory_bytes);
         let mut store = Store::new(engine, store_data);
 
         if self.runtime.config().fuel_config.enabled {
@@ -68,7 +72,7 @@ impl WasmToolWrapper {
 
         let component = self.prepared.component().clone();
         let mut linker = Linker::new(engine);
-        Self::add_host_functions(&mut linker)?;
+        add_metadata_host_functions(&mut linker)?;
 
         let instance =
             SandboxedTool::instantiate(&mut store, &component, &linker).map_err(|e| {
@@ -89,11 +93,79 @@ impl WasmToolWrapper {
     }
 }
 
+struct MetadataStoreData {
+    limiter: WasmResourceLimiter,
+    wasi: WasiCtx,
+    table: ResourceTable,
+}
+
+impl MetadataStoreData {
+    fn new(memory_limit: u64) -> Self {
+        Self {
+            limiter: WasmResourceLimiter::new(memory_limit),
+            wasi: WasiCtxBuilder::new().build(),
+            table: ResourceTable::new(),
+        }
+    }
+}
+
+impl WasiView for MetadataStoreData {
+    fn ctx(&mut self) -> &mut WasiCtx {
+        &mut self.wasi
+    }
+
+    fn table(&mut self) -> &mut ResourceTable {
+        &mut self.table
+    }
+}
+
+impl near::agent::host::Host for MetadataStoreData {
+    fn log(&mut self, _level: near::agent::host::LogLevel, _message: String) {}
+
+    fn now_millis(&mut self) -> u64 {
+        0
+    }
+
+    fn workspace_read(&mut self, _path: String) -> Option<String> {
+        None
+    }
+
+    fn http_request(
+        &mut self,
+        _method: String,
+        _url: String,
+        _headers_json: String,
+        _body: Option<Vec<u8>>,
+        _timeout_ms: Option<u32>,
+    ) -> Result<near::agent::host::HttpResponse, String> {
+        Err("metadata export context does not permit http_request".to_string())
+    }
+
+    fn tool_invoke(&mut self, _alias: String, _params_json: String) -> Result<String, String> {
+        Err("metadata export context does not permit tool_invoke".to_string())
+    }
+
+    fn secret_exists(&mut self, _name: String) -> bool {
+        false
+    }
+}
+
+fn add_metadata_host_functions(linker: &mut Linker<MetadataStoreData>) -> Result<(), WasmError> {
+    wasmtime_wasi::add_to_linker_sync(linker)
+        .map_err(|e| WasmError::ConfigError(format!("Failed to add WASI functions: {}", e)))?;
+    near::agent::host::add_to_linker(linker, |state| state)
+        .map_err(|e| WasmError::ConfigError(format!("Failed to add host functions: {}", e)))?;
+    Ok(())
+}
+
 /// Read metadata directly from the guest's `description()` and `schema()` exports.
-fn read_metadata_exports(
+fn read_metadata_exports<T>(
     tool_iface: &wit_tool::Guest,
-    store: &mut Store<StoreData>,
-) -> Result<(String, serde_json::Value), WasmError> {
+    store: &mut Store<T>,
+) -> Result<(String, serde_json::Value), WasmError>
+where
+    T: WasiView + near::agent::host::Host,
+{
     let description = tool_iface
         .call_description(&mut *store)
         .map_err(|e| WasmError::InstantiationFailed(e.to_string()))?;
@@ -151,21 +223,11 @@ mod tests {
 
     use crate::registry::artifacts::find_wasm_artifact;
     use crate::tools::wasm::capabilities::Capabilities;
-    use crate::tools::wasm::limits::ResourceLimits;
-    use crate::tools::wasm::runtime::{WasmRuntimeConfig, WasmToolRuntime};
+    use crate::tools::wasm::{ResourceLimits, WasmRuntimeConfig, WasmToolRuntime};
 
     use super::super::WasmToolWrapper;
 
-    fn github_wasm_artifact() -> Option<PathBuf> {
-        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        find_wasm_artifact(
-            &repo_root.join("tools-src/github"),
-            "github-tool",
-            "release",
-        )
-    }
-
-    fn metadata_test_runtime() -> Arc<WasmToolRuntime> {
+    fn metadata_test_runtime() -> anyhow::Result<Arc<WasmToolRuntime>> {
         let config = WasmRuntimeConfig {
             default_limits: ResourceLimits::default()
                 .with_memory(8 * 1024 * 1024)
@@ -173,20 +235,19 @@ mod tests {
                 .with_timeout(Duration::from_secs(5)),
             ..WasmRuntimeConfig::for_testing()
         };
-        Arc::new(WasmToolRuntime::new(config).expect("create wasm runtime for metadata tests"))
+        Ok(Arc::new(WasmToolRuntime::new(config)?))
     }
 
     #[tokio::test]
     async fn test_exported_metadata_from_real_github_component() {
-        let Some(wasm_path) = github_wasm_artifact() else {
-            eprintln!("Skipping exported metadata regression: github WASM artifact not built");
-            return;
-        };
+        let source_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tools-src/github");
+        let wasm_path = find_wasm_artifact(&source_dir, "github-tool", "release")
+            .expect("github WASM artifact must be built for metadata tests");
 
-        let runtime = metadata_test_runtime();
+        let runtime = metadata_test_runtime().expect("create metadata test runtime");
         let wasm_bytes = std::fs::read(&wasm_path).expect("read github wasm artifact");
         let prepared = runtime
-            .prepare("github", &wasm_bytes, None)
+            .prepare("github", &wasm_bytes, None::<ResourceLimits>)
             .await
             .expect("prepare github wasm component");
         let wrapper = WasmToolWrapper::new(runtime, prepared, Capabilities::default());
@@ -208,16 +269,16 @@ mod tests {
                 .any(|value| value == "action"),
             "expected required action field in schema: {schema}"
         );
-        let first_variant = schema["oneOf"]
-            .as_array()
-            .and_then(|variants| variants.first())
-            .expect("oneOf variants");
+        assert!(
+            schema.get("oneOf").is_none(),
+            "top-level oneOf should not be exported for OpenAI compatibility: {schema}"
+        );
         assert_eq!(
-            first_variant["properties"]["action"]["const"],
+            schema["properties"]["action"]["enum"][0],
             serde_json::json!("get_repo")
         );
         assert_eq!(
-            first_variant["properties"]["owner"]["type"],
+            schema["properties"]["owner"]["type"],
             serde_json::json!("string")
         );
     }
