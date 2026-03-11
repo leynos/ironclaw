@@ -88,7 +88,10 @@ impl Tool for RoutineCreateTool {
                 },
                 "event_filters": {
                     "type": "object",
-                    "description": "Optional exact-match filters against payload fields for system_event triggers. Values can be strings, numbers, or booleans."
+                    "description": "Optional exact-match filters against payload fields for system_event triggers. Values can be strings, numbers, or booleans.",
+                    "additionalProperties": {
+                        "type": ["string", "number", "boolean"]
+                    }
                 },
                 "prompt": {
                     "type": "string",
@@ -892,7 +895,10 @@ impl Tool for EventEmitTool {
                 },
                 "payload": {
                     "type": "object",
-                    "description": "Structured event payload"
+                    "description": "Structured event payload",
+                    "additionalProperties": {
+                        "type": ["string", "number", "boolean"]
+                    }
                 }
             },
             "required": ["event_source", "event_type"]

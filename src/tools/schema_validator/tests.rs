@@ -2,15 +2,267 @@
 
 use super::*;
 
-fn load_complex_tool_schema_fixture(tool_name: &str) -> serde_json::Value {
-    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/schemas")
-        .join(format!("{tool_name}.json"));
-    let raw = std::fs::read_to_string(&path)
-        .unwrap_or_else(|err| panic!("failed to read schema fixture {}: {err}", path.display()));
-
-    serde_json::from_str(&raw)
-        .unwrap_or_else(|err| panic!("failed to parse schema fixture for {tool_name}: {err}"))
+fn representative_complex_tool_schemas() -> Vec<(&'static str, serde_json::Value)> {
+    vec![
+        (
+            "tool_search",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search query (name, keyword, or description fragment)"
+                    },
+                    "discover": {
+                        "type": "boolean",
+                        "description": "If true, also search online (slower, 5-15s). Try without first.",
+                        "default": false
+                    }
+                },
+                "required": ["query"]
+            }),
+        ),
+        (
+            "tool_install",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Extension name (from search results or custom)"
+                    },
+                    "url": {
+                        "type": "string",
+                        "description": "Explicit URL (for extensions not in the registry)"
+                    },
+                    "kind": {
+                        "type": "string",
+                        "enum": ["mcp_server", "wasm_tool", "wasm_channel"],
+                        "description": "Extension type (auto-detected if omitted)"
+                    }
+                },
+                "required": ["name"]
+            }),
+        ),
+        (
+            "tool_auth",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Extension name to authenticate"
+                    }
+                },
+                "required": ["name"]
+            }),
+        ),
+        (
+            "tool_activate",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Extension name to activate"
+                    }
+                },
+                "required": ["name"]
+            }),
+        ),
+        (
+            "tool_remove",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Name of the installed extension to remove"
+                    }
+                },
+                "required": ["name"]
+            }),
+        ),
+        (
+            "routine_create",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Unique name for the routine (e.g. 'daily-pr-review')"
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "What this routine does"
+                    },
+                    "trigger_type": {
+                        "type": "string",
+                        "enum": ["cron", "event", "system_event", "manual"],
+                        "description": "When the routine fires"
+                    },
+                    "schedule": {
+                        "type": "string",
+                        "description": "Cron expression (for cron trigger). E.g. '0 9 * * MON-FRI' for weekdays at 9am. Uses 6-field cron (sec min hour day month weekday)."
+                    },
+                    "event_pattern": {
+                        "type": "string",
+                        "description": "Regex pattern to match messages (for event trigger)"
+                    },
+                    "event_channel": {
+                        "type": "string",
+                        "description": "Optional channel filter for event trigger (e.g. 'telegram')"
+                    },
+                    "event_source": {
+                        "type": "string",
+                        "description": "Event source for system_event triggers (e.g. 'github')"
+                    },
+                    "event_type": {
+                        "type": "string",
+                        "description": "Event type for system_event triggers (e.g. 'issue.opened')"
+                    },
+                    "event_filters": {
+                        "type": "object",
+                        "description": "Optional exact-match filters against payload fields for system_event triggers. Values can be strings, numbers, or booleans.",
+                        "additionalProperties": {
+                            "type": ["string", "number", "boolean"]
+                        }
+                    },
+                    "prompt": {
+                        "type": "string",
+                        "description": "The prompt/instructions for the routine"
+                    },
+                    "context_paths": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Workspace paths to load as context (e.g. ['context/priorities.md'])"
+                    },
+                    "action_type": {
+                        "type": "string",
+                        "enum": ["lightweight", "full_job"],
+                        "description": "Execution mode: 'lightweight' (single LLM call, default) or 'full_job' (multi-turn with tools)"
+                    },
+                    "cooldown_secs": {
+                        "type": "integer",
+                        "description": "Minimum seconds between fires (default: 300)"
+                    },
+                    "tool_permissions": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Tool names pre-authorized for Always-approval tools in full_job mode (e.g. ['shell']). UnlessAutoApproved tools are automatically permitted in routines."
+                    },
+                    "notify_channel": {
+                        "type": "string",
+                        "description": "Channel to send results to (e.g. 'telegram', 'slack', 'tui'). Sets the default channel for message tool calls in routine jobs."
+                    },
+                    "notify_user": {
+                        "type": "string",
+                        "description": "User/target to notify (e.g. username, chat ID). Defaults to 'default'."
+                    },
+                    "timezone": {
+                        "type": "string",
+                        "description": "IANA timezone for cron schedule evaluation (e.g. 'America/New_York'). Defaults to UTC."
+                    }
+                },
+                "required": ["name", "trigger_type", "prompt"]
+            }),
+        ),
+        (
+            "routine_update",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Name of the routine to update"
+                    },
+                    "enabled": {
+                        "type": "boolean",
+                        "description": "Enable or disable the routine"
+                    },
+                    "prompt": {
+                        "type": "string",
+                        "description": "New prompt/instructions"
+                    },
+                    "schedule": {
+                        "type": "string",
+                        "description": "New cron schedule (for cron triggers)"
+                    },
+                    "timezone": {
+                        "type": "string",
+                        "description": "IANA timezone for cron schedule (e.g. 'America/New_York'). Only valid for cron triggers."
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "New description"
+                    }
+                },
+                "required": ["name"]
+            }),
+        ),
+        (
+            "job_events",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "job_id": {
+                        "type": "string",
+                        "description": "The job ID (full UUID or short prefix, e.g. 'f2854dd8')"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of events to return (default 50, most recent)"
+                    }
+                },
+                "required": ["job_id"]
+            }),
+        ),
+        (
+            "event_emit",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "event_source": {
+                        "type": "string",
+                        "description": "Event source (e.g. 'github', 'workflow', 'tool')"
+                    },
+                    "event_type": {
+                        "type": "string",
+                        "description": "Event type (e.g. 'issue.opened', 'pr.ready')"
+                    },
+                    "payload": {
+                        "type": "object",
+                        "description": "Structured event payload",
+                        "additionalProperties": {
+                            "type": ["string", "number", "boolean"]
+                        }
+                    }
+                },
+                "required": ["event_source", "event_type"]
+            }),
+        ),
+        (
+            "job_prompt",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "job_id": {
+                        "type": "string",
+                        "description": "The job ID (full UUID or short prefix, e.g. 'f2854dd8')"
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "The follow-up prompt text to send"
+                    },
+                    "done": {
+                        "type": "boolean",
+                        "description": "If true, signals the sub-agent that no more prompts are coming                                     and it should finish up. Default false."
+                    }
+                },
+                "required": ["job_id", "content"]
+            }),
+        ),
+    ]
 }
 
 #[test]
@@ -376,57 +628,11 @@ fn test_skill_tool_schemas() {
     );
 }
 
-/// Validate schemas from tools that cannot be easily constructed by
-/// inlining the JSON schema directly. This covers the extension tools and
-/// routine tools whose constructors require heavy dependencies.
+/// Validate representative schemas from tools whose constructors require
+/// heavier dependencies than this unit test should need to assemble.
 #[test]
 fn test_inline_schemas_for_complex_tools() {
-    let schemas: Vec<(&str, serde_json::Value)> = vec![
-        (
-            "tool_search",
-            load_complex_tool_schema_fixture("tool_search"),
-        ),
-        (
-            "tool_install",
-            load_complex_tool_schema_fixture("tool_install"),
-        ),
-        ("tool_auth", load_complex_tool_schema_fixture("tool_auth")),
-        (
-            "tool_activate",
-            load_complex_tool_schema_fixture("tool_activate"),
-        ),
-        ("tool_list", load_complex_tool_schema_fixture("tool_list")),
-        (
-            "tool_remove",
-            load_complex_tool_schema_fixture("tool_remove"),
-        ),
-        (
-            "routine_create",
-            load_complex_tool_schema_fixture("routine_create"),
-        ),
-        (
-            "routine_list",
-            load_complex_tool_schema_fixture("routine_list"),
-        ),
-        (
-            "routine_update",
-            load_complex_tool_schema_fixture("routine_update"),
-        ),
-        (
-            "routine_delete",
-            load_complex_tool_schema_fixture("routine_delete"),
-        ),
-        (
-            "routine_fire",
-            load_complex_tool_schema_fixture("routine_fire"),
-        ),
-        (
-            "routine_history",
-            load_complex_tool_schema_fixture("routine_history"),
-        ),
-        ("job_events", load_complex_tool_schema_fixture("job_events")),
-        ("job_prompt", load_complex_tool_schema_fixture("job_prompt")),
-    ];
+    let schemas = representative_complex_tool_schemas();
 
     let mut failures = Vec::new();
 

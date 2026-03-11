@@ -295,9 +295,13 @@ mod tests {
             .expect("Failed to send request");
         assert_eq!(response.status(), 200, "Server should be listening");
 
-        // Try to restart on an invalid address (port 0 is reserved, won't bind)
-        // Use port 1 which typically requires elevated privileges
-        let invalid_addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        // Hold a second listener open so rebinding to that address fails
+        // regardless of privilege level or container user.
+        let occupied_listener =
+            StdTcpListener::bind("127.0.0.1:0").expect("Failed to reserve occupied port");
+        let invalid_addr = occupied_listener
+            .local_addr()
+            .expect("Failed to get occupied listener addr");
 
         // Attempt restart (should fail)
         let result = server.restart_with_addr(invalid_addr).await;
