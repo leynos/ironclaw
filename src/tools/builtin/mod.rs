@@ -15,6 +15,7 @@ pub mod secrets_tools;
 pub(crate) mod shell;
 pub mod skill_tools;
 mod time;
+pub(crate) mod worker_extension_proxy;
 
 pub use echo::EchoTool;
 pub use extension_tools::{
@@ -32,8 +33,8 @@ pub use memory::{MemoryReadTool, MemorySearchTool, MemoryTreeTool, MemoryWriteTo
 pub use message::MessageTool;
 pub use restart::RestartTool;
 pub use routine::{
-    RoutineCreateTool, RoutineDeleteTool, RoutineFireTool, RoutineHistoryTool, RoutineListTool,
-    RoutineUpdateTool,
+    EventEmitTool, RoutineCreateTool, RoutineDeleteTool, RoutineFireTool, RoutineHistoryTool,
+    RoutineListTool, RoutineUpdateTool,
 };
 pub use secrets_tools::{SecretDeleteTool, SecretListTool};
 pub use shell::ShellTool;

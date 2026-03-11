@@ -11,6 +11,7 @@ use crate::llm::{
     ChatMessage, CompletionRequest, CompletionResponse, FinishReason, ToolCall,
     ToolCompletionRequest, ToolCompletionResponse, ToolDefinition,
 };
+use crate::tools::ToolOutput;
 
 /// HTTP client that a container worker uses to talk to the orchestrator.
 pub struct WorkerHttpClient {
@@ -79,6 +80,17 @@ pub struct ProxyToolCompletionResponse {
     pub cache_read_input_tokens: u32,
     #[serde(default)]
     pub cache_creation_input_tokens: u32,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ProxyExtensionToolRequest {
+    pub tool_name: String,
+    pub params: serde_json::Value,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ProxyExtensionToolResponse {
+    pub output: ToolOutput,
 }
 
 /// Completion result for the worker to report when done.
@@ -269,6 +281,24 @@ impl WorkerHttpClient {
         })
     }
 
+    /// Execute an extension-management tool against the orchestrator-side app state.
+    pub async fn execute_extension_tool(
+        &self,
+        tool_name: &str,
+        params: &serde_json::Value,
+    ) -> Result<ToolOutput, WorkerError> {
+        let proxy_req = ProxyExtensionToolRequest {
+            tool_name: tool_name.to_string(),
+            params: params.clone(),
+        };
+
+        let proxy_resp: ProxyExtensionToolResponse = self
+            .post_json("extension_tool", &proxy_req, "Extension tool execution")
+            .await?;
+
+        Ok(proxy_resp.output)
+    }
+
     /// Report status to the orchestrator.
     pub async fn report_status(&self, update: &StatusUpdate) -> Result<(), WorkerError> {
         let resp = self
@@ -419,13 +449,14 @@ fn parse_finish_reason(s: &str) -> FinishReason {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::credentials::TEST_BEARER_TOKEN;
 
     #[test]
     fn test_url_construction() {
         let client = WorkerHttpClient::new(
             "http://host.docker.internal:50051".to_string(),
             Uuid::nil(),
-            "test-token".to_string(),
+            TEST_BEARER_TOKEN.to_string(),
         );
 
         assert_eq!(
@@ -449,7 +480,7 @@ mod tests {
         let client = WorkerHttpClient::new(
             "http://host.docker.internal:50051".to_string(),
             Uuid::nil(),
-            "test-token".to_string(),
+            TEST_BEARER_TOKEN.to_string(),
         );
 
         assert_eq!(

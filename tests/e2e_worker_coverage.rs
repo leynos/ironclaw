@@ -95,13 +95,20 @@ mod tests {
         // is updated to write here via the test_dir variable.
         let tmp = tempfile::tempdir().expect("create temp dir");
         let test_dir = tmp.path().to_str().expect("tempdir path");
+        let blocking_parent = tmp.path().join("blocking-parent");
+        std::fs::write(&blocking_parent, "occupied").expect("create blocking file");
 
-        // Patch the fixture's recovery path to use our tempdir.
+        // Patch the fixture's failing path to point through an existing file and
+        // the recovery path to use our tempdir.
         let fixture_str = std::fs::read_to_string(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/tests/fixtures/llm_traces/worker/tool_error_feedback.json"
         ))
         .expect("read fixture");
+        let fixture_str = fixture_str.replace(
+            "/nonexistent_root_dir_xyz/impossible/file.txt",
+            &format!("{test_dir}/blocking-parent/file.txt"),
+        );
         let fixture_str = fixture_str.replace(
             "/tmp/ironclaw_error_feedback_test/recovered.txt",
             &format!("{test_dir}/recovered.txt"),
@@ -113,7 +120,7 @@ mod tests {
             .build()
             .await;
 
-        rig.send_message("Write a file to a bad path then recover")
+        rig.send_message("write a file to a bad path then recover")
             .await;
         let responses = rig.wait_for_responses(1, Duration::from_secs(15)).await;
 
