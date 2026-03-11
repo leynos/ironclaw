@@ -24,6 +24,7 @@ fn test_extension_manager() -> Arc<ExtensionManager> {
 
     Arc::new(ExtensionManager::new(
         Arc::new(McpSessionManager::new()),
+        Arc::new(crate::tools::mcp::McpProcessManager::new()),
         Arc::new(InMemorySecretsStore::new(crypto)),
         Arc::new(ToolRegistry::new()),
         None,

@@ -40,6 +40,7 @@ fn extension_manager_fixture() -> ExtensionManagerFixture {
         _dir: dir,
         manager: std::sync::Arc::new(ironclaw::extensions::ExtensionManager::new(
             std::sync::Arc::new(McpSessionManager::new()),
+            std::sync::Arc::new(ironclaw::tools::mcp::McpProcessManager::new()),
             std::sync::Arc::new(InMemorySecretsStore::new(crypto)),
             std::sync::Arc::new(ToolRegistry::new()),
             None,
