@@ -29,6 +29,8 @@ use crate::tools::wasm::host::{HostState, LogLevel};
 use crate::tools::wasm::limits::{ResourceLimits, WasmResourceLimiter};
 use crate::tools::wasm::runtime::{EPOCH_TICK_INTERVAL, PreparedModule, WasmToolRuntime};
 
+mod metadata;
+
 // Generate component model bindings from the WIT file.
 //
 // This creates:
@@ -99,6 +101,11 @@ struct StoreData {
     /// Dedicated tokio runtime for HTTP requests, lazily initialized.
     /// Reused across multiple `http_request` calls within one execution.
     http_runtime: Option<tokio::runtime::Runtime>,
+}
+
+struct PreparedHttpRequest {
+    url: String,
+    headers: HashMap<String, String>,
 }
 
 impl StoreData {
@@ -216,6 +223,65 @@ impl StoreData {
             }
         }
     }
+
+    fn prepare_http_request(
+        &mut self,
+        method: &str,
+        url: &str,
+        headers_json: &str,
+        body: Option<&[u8]>,
+    ) -> Result<PreparedHttpRequest, String> {
+        // Inject credentials into URL (e.g., replace {TELEGRAM_BOT_TOKEN})
+        let injected_url = self.inject_credentials(url, "url");
+
+        // Check HTTP allowlist
+        self.host_state
+            .check_http_allowed(&injected_url, method)
+            .map_err(|e| format!("HTTP not allowed: {}", e))?;
+
+        // Record for rate limiting
+        self.host_state
+            .record_http_request()
+            .map_err(|e| format!("Rate limit exceeded: {}", e))?;
+
+        // Parse headers and inject credentials into header values
+        let raw_headers: HashMap<String, String> =
+            serde_json::from_str(headers_json).unwrap_or_default();
+
+        let mut headers: HashMap<String, String> = raw_headers
+            .into_iter()
+            .map(|(k, v)| {
+                (
+                    k.clone(),
+                    self.inject_credentials(&v, &format!("header:{}", k)),
+                )
+            })
+            .collect();
+
+        let mut url = injected_url;
+
+        // Leak scan runs on WASM-provided values BEFORE host credential injection.
+        // This prevents false positives where the host-injected Bearer token
+        // (e.g. a GitHub PAT) triggers the leak detector even though the WASM
+        // tool never saw or supplied the real secret value.
+        let leak_detector = LeakDetector::new();
+        let header_vec: Vec<(String, String)> = headers
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+
+        leak_detector
+            .scan_http_request(&url, &header_vec, body)
+            .map_err(|e| format!("Potential secret leak blocked: {}", e))?;
+
+        // Inject pre-resolved host credentials (Bearer tokens, API keys, etc.)
+        // after the leak scan so host-injected secrets don't trigger false positives.
+        if let Some(host) = extract_host_from_url(&url) {
+            self.inject_host_credentials(&host, &mut headers, &mut url);
+        }
+
+        Ok(PreparedHttpRequest { url, headers })
+    }
 }
 
 // Provide WASI context for the WASM component.
@@ -262,61 +328,8 @@ impl near::agent::host::Host for StoreData {
         body: Option<Vec<u8>>,
         timeout_ms: Option<u32>,
     ) -> Result<near::agent::host::HttpResponse, String> {
-        // Inject credentials into URL (e.g., replace {TELEGRAM_BOT_TOKEN})
-        let injected_url = self.inject_credentials(&url, "url");
-
-        // Check HTTP allowlist
-        self.host_state
-            .check_http_allowed(&injected_url, &method)
-            .map_err(|e| format!("HTTP not allowed: {}", e))?;
-
-        // Record for rate limiting
-        self.host_state
-            .record_http_request()
-            .map_err(|e| format!("Rate limit exceeded: {}", e))?;
-
-        // Parse headers and inject credentials into header values
-        let raw_headers: HashMap<String, String> =
-            serde_json::from_str(&headers_json).unwrap_or_default();
-
-        // Leak scan runs on WASM-provided values BEFORE host credential injection.
-        // This prevents false positives where the host-injected Bearer token
-        // (e.g., xoxb- Slack token) triggers the leak detector — WASM never saw
-        // the real value, so scanning the pre-injection state is correct.
-        // Inline the scan to avoid allocating a Vec of cloned headers.
-        let leak_detector = LeakDetector::new();
-        leak_detector
-            .scan_and_clean(&injected_url)
-            .map_err(|e| format!("Potential secret leak in URL blocked: {}", e))?;
-        for (name, value) in &raw_headers {
-            leak_detector.scan_and_clean(value).map_err(|e| {
-                format!("Potential secret leak in header '{}' blocked: {}", name, e)
-            })?;
-        }
-        if let Some(body_bytes) = body.as_deref() {
-            let body_str = String::from_utf8_lossy(body_bytes);
-            leak_detector
-                .scan_and_clean(&body_str)
-                .map_err(|e| format!("Potential secret leak in body blocked: {}", e))?;
-        }
-
-        let mut headers: HashMap<String, String> = raw_headers
-            .into_iter()
-            .map(|(k, v)| {
-                (
-                    k.clone(),
-                    self.inject_credentials(&v, &format!("header:{}", k)),
-                )
-            })
-            .collect();
-
-        let mut url = injected_url;
-
-        // Inject pre-resolved host credentials (Bearer tokens, API keys, etc.)
-        // based on the request's target host.
-        if let Some(host) = extract_host_from_url(&url) {
-            self.inject_host_credentials(&host, &mut headers, &mut url);
-        }
+        let PreparedHttpRequest { url, headers } =
+            self.prepare_http_request(&method, &url, &headers_json, body.as_deref())?;
 
         // Get the max response size from capabilities (default 10MB).
         let max_response_bytes = self
@@ -422,7 +435,7 @@ impl near::agent::host::Host for StoreData {
 
             // Leak detection on response body
             if let Ok(body_str) = std::str::from_utf8(&body) {
-                leak_detector
+                LeakDetector::new()
                     .scan_and_clean(body_str)
                     .map_err(|e| format!("Potential secret leak in response: {}", e))?;
             }
@@ -485,8 +498,8 @@ impl WasmToolWrapper {
         capabilities: Capabilities,
     ) -> Self {
         Self {
-            description: prepared.description.clone(),
-            schema: prepared.schema.clone(),
+            description: metadata::placeholder_description(),
+            schema: metadata::placeholder_schema(),
             runtime,
             prepared,
             capabilities,
@@ -649,56 +662,13 @@ impl WasmToolWrapper {
         // correct parameters without us having to include the (large) schema
         // in every request's tools array.
         if let Some(err) = response.error {
-            let hint = build_tool_hint(tool_iface, &mut store);
+            let hint = metadata::build_tool_hint(tool_iface, &mut store);
             return Err(WasmError::ToolReturnedError { message: err, hint });
         }
 
         // Return result (or empty string if none)
         Ok((response.output.unwrap_or_default(), logs))
     }
-}
-
-/// Maximum characters for the description portion of a tool hint.
-const HINT_DESC_MAX: usize = 500;
-/// Maximum characters for the schema portion of a tool hint.
-const HINT_SCHEMA_MAX: usize = 3000;
-
-/// Call the WASM module's `description()` and `schema()` exports to build a
-/// hint string.  Returns an empty string if both calls fail or return empty.
-/// Description is capped at [`HINT_DESC_MAX`] chars, schema at
-/// [`HINT_SCHEMA_MAX`] chars.
-fn build_tool_hint(tool_iface: &wit_tool::Guest, store: &mut Store<StoreData>) -> String {
-    let desc = tool_iface
-        .call_description(&mut *store)
-        .ok()
-        .unwrap_or_default();
-    let schema = tool_iface.call_schema(&mut *store).ok().unwrap_or_default();
-    if desc.is_empty() && schema.is_empty() {
-        return String::new();
-    }
-    let mut hint = String::new();
-    if !desc.is_empty() {
-        hint.push_str("Description: ");
-        if desc.len() > HINT_DESC_MAX {
-            let end = crate::util::floor_char_boundary(&desc, HINT_DESC_MAX);
-            hint.push_str(&desc[..end]);
-            hint.push('…');
-        } else {
-            hint.push_str(&desc);
-        }
-        hint.push('\n');
-    }
-    if !schema.is_empty() {
-        hint.push_str("Parameters schema: ");
-        if schema.len() > HINT_SCHEMA_MAX {
-            let end = crate::util::floor_char_boundary(&schema, HINT_SCHEMA_MAX);
-            hint.push_str(&schema[..end]);
-            hint.push('…');
-        } else {
-            hint.push_str(&schema);
-        }
-    }
-    hint
 }
 
 #[async_trait]
@@ -1223,11 +1193,6 @@ fn coerce_params_to_schema(
 mod tests {
     use std::sync::Arc;
 
-    use crate::testing::credentials::{
-        TEST_BEARER_TOKEN_123, TEST_GOOGLE_OAUTH_FRESH, TEST_GOOGLE_OAUTH_LEGACY,
-        TEST_GOOGLE_OAUTH_TOKEN, TEST_OAUTH_CLIENT_ID, TEST_OAUTH_CLIENT_SECRET,
-        test_secrets_store,
-    };
     use crate::tools::wasm::capabilities::Capabilities;
     use crate::tools::wasm::runtime::{WasmRuntimeConfig, WasmToolRuntime};
 
@@ -1236,7 +1201,7 @@ mod tests {
         // This test verifies the runtime can be created
         // Actual execution tests require a valid WASM component
         let config = WasmRuntimeConfig::for_testing();
-        let runtime = Arc::new(WasmToolRuntime::new(config).unwrap());
+        let runtime = Arc::new(WasmToolRuntime::new(config).expect("create wasm runtime"));
 
         // Runtime was created successfully
         assert!(runtime.config().fuel_config.enabled);
@@ -1295,12 +1260,12 @@ mod tests {
                 let mut h = HashMap::new();
                 h.insert(
                     "Authorization".to_string(),
-                    format!("Bearer {TEST_BEARER_TOKEN_123}"),
+                    "Bearer test-token-123".to_string(),
                 );
                 h
             },
             query_params: HashMap::new(),
-            secret_value: TEST_BEARER_TOKEN_123.to_string(),
+            secret_value: "test-token-123".to_string(),
         }];
 
         let store_data = StoreData::new(
@@ -1316,7 +1281,7 @@ mod tests {
         store_data.inject_host_credentials("www.googleapis.com", &mut headers, &mut url);
         assert_eq!(
             headers.get("Authorization"),
-            Some(&format!("Bearer {TEST_BEARER_TOKEN_123}"))
+            Some(&"Bearer test-token-123".to_string())
         );
 
         // Should not inject for non-matching host
@@ -1381,6 +1346,144 @@ mod tests {
         assert!(redacted.contains("[REDACTED:host_credential]"));
     }
 
+    fn test_github_pat() -> String {
+        format!("github_pat_{}_{}", "A".repeat(22), "B".repeat(59))
+    }
+
+    fn test_prepare_request_capabilities(host: &str) -> Capabilities {
+        use crate::tools::wasm::capabilities::{EndpointPattern, HttpCapability};
+
+        Capabilities {
+            http: Some(HttpCapability::new(vec![
+                EndpointPattern::host(host.to_string())
+                    .with_path_prefix("/")
+                    .with_methods(vec!["GET".to_string()]),
+            ])),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_prepare_http_request_allows_host_injected_github_pat() {
+        use crate::tools::wasm::wrapper::{ResolvedHostCredential, StoreData};
+        use std::collections::HashMap;
+
+        let pat = test_github_pat();
+        let host = "api.github.invalid";
+        let host_credentials = vec![ResolvedHostCredential {
+            host_patterns: vec![host.to_string()],
+            headers: {
+                let mut h = HashMap::new();
+                h.insert("Authorization".to_string(), format!("Bearer {pat}"));
+                h
+            },
+            query_params: HashMap::new(),
+            secret_value: pat.clone(),
+        }];
+
+        let mut store_data = StoreData::new(
+            1024 * 1024,
+            test_prepare_request_capabilities(host),
+            HashMap::new(),
+            host_credentials,
+        );
+
+        let prepared = store_data
+            .prepare_http_request(
+                "GET",
+                &format!("https://{host}/repos/leynos/mxd"),
+                "{}",
+                None,
+            )
+            .expect("host-injected PAT should not trip leak scanning");
+
+        assert_eq!(
+            prepared.headers.get("Authorization"),
+            Some(&format!("Bearer {pat}"))
+        );
+        assert_eq!(prepared.url, format!("https://{host}/repos/leynos/mxd"));
+    }
+
+    #[test]
+    fn test_prepare_http_request_blocks_wasm_supplied_github_pat() {
+        use crate::tools::wasm::wrapper::StoreData;
+        use std::collections::HashMap;
+
+        let pat = test_github_pat();
+        let host = "api.github.invalid";
+        let mut store_data = StoreData::new(
+            1024 * 1024,
+            test_prepare_request_capabilities(host),
+            HashMap::new(),
+            Vec::new(),
+        );
+
+        let headers_json = serde_json::json!({
+            "Authorization": format!("Bearer {pat}")
+        })
+        .to_string();
+
+        let err = match store_data.prepare_http_request(
+            "GET",
+            &format!("https://{host}/repos/leynos/mxd"),
+            &headers_json,
+            None,
+        ) {
+            Ok(_) => panic!("WASM-supplied PAT must still be blocked"),
+            Err(err) => err,
+        };
+
+        assert!(err.contains("Potential secret leak blocked"));
+        assert!(err.contains("header:Authorization"));
+        assert!(err.contains("github_fine_grained_pat"));
+    }
+
+    #[test]
+    fn test_http_request_progresses_past_leak_scan_for_host_injected_github_pat() {
+        use crate::tools::wasm::wrapper::near::agent::host;
+        use crate::tools::wasm::wrapper::{ResolvedHostCredential, StoreData};
+        use std::collections::HashMap;
+
+        let pat = test_github_pat();
+        let host = "api.github.invalid";
+        let host_credentials = vec![ResolvedHostCredential {
+            host_patterns: vec![host.to_string()],
+            headers: {
+                let mut h = HashMap::new();
+                h.insert("Authorization".to_string(), format!("Bearer {pat}"));
+                h
+            },
+            query_params: HashMap::new(),
+            secret_value: pat,
+        }];
+
+        let mut store_data = StoreData::new(
+            1024 * 1024,
+            test_prepare_request_capabilities(host),
+            HashMap::new(),
+            host_credentials,
+        );
+
+        let err = <StoreData as host::Host>::http_request(
+            &mut store_data,
+            "GET".to_string(),
+            format!("https://{host}/repos/leynos/mxd"),
+            "{}".to_string(),
+            None,
+            Some(1000),
+        )
+        .expect_err("invalid public hostname should fail after request preparation");
+
+        assert!(
+            !err.contains("Potential secret leak blocked"),
+            "request should progress past leak scanning, got: {err}"
+        );
+        assert!(
+            err.contains("DNS resolution failed"),
+            "expected later-stage DNS failure, got: {err}"
+        );
+    }
+
     #[tokio::test]
     async fn test_resolve_host_credentials_no_store() {
         use crate::tools::wasm::wrapper::resolve_host_credentials;
@@ -1392,9 +1495,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_resolve_host_credentials_no_http_cap() {
+        use crate::secrets::{InMemorySecretsStore, SecretsCrypto};
         use crate::tools::wasm::wrapper::resolve_host_credentials;
+        use secrecy::SecretString;
 
-        let store = test_secrets_store();
+        let key = "0123456789abcdef0123456789abcdef";
+        let crypto = Arc::new(SecretsCrypto::new(SecretString::from(key.to_string())).unwrap());
+        let store = InMemorySecretsStore::new(crypto);
 
         let caps = Capabilities::default();
         let result = resolve_host_credentials(&caps, Some(&store), "user1", None).await;
@@ -1406,17 +1513,21 @@ mod tests {
         use std::collections::HashMap;
 
         use crate::secrets::{
-            CreateSecretParams, CredentialLocation, CredentialMapping, SecretsStore,
+            CreateSecretParams, CredentialLocation, CredentialMapping, InMemorySecretsStore,
+            SecretsCrypto, SecretsStore,
         };
         use crate::tools::wasm::capabilities::HttpCapability;
         use crate::tools::wasm::wrapper::resolve_host_credentials;
+        use secrecy::SecretString;
 
-        let store = test_secrets_store();
+        let key = "0123456789abcdef0123456789abcdef";
+        let crypto = Arc::new(SecretsCrypto::new(SecretString::from(key.to_string())).unwrap());
+        let store = InMemorySecretsStore::new(crypto);
 
         store
             .create(
                 "user1",
-                CreateSecretParams::new("google_oauth_token", TEST_GOOGLE_OAUTH_TOKEN),
+                CreateSecretParams::new("google_oauth_token", "ya29.test-token"),
             )
             .await
             .unwrap();
@@ -1444,7 +1555,7 @@ mod tests {
         assert_eq!(result[0].host_patterns, vec!["www.googleapis.com"]);
         assert_eq!(
             result[0].headers.get("Authorization"),
-            Some(&format!("Bearer {TEST_GOOGLE_OAUTH_TOKEN}"))
+            Some(&"Bearer ya29.test-token".to_string())
         );
     }
 
@@ -1452,11 +1563,16 @@ mod tests {
     async fn test_resolve_host_credentials_missing_secret() {
         use std::collections::HashMap;
 
-        use crate::secrets::{CredentialLocation, CredentialMapping};
+        use crate::secrets::{
+            CredentialLocation, CredentialMapping, InMemorySecretsStore, SecretsCrypto,
+        };
         use crate::tools::wasm::capabilities::HttpCapability;
         use crate::tools::wasm::wrapper::resolve_host_credentials;
+        use secrecy::SecretString;
 
-        let store = test_secrets_store();
+        let key = "0123456789abcdef0123456789abcdef";
+        let crypto = Arc::new(SecretsCrypto::new(SecretString::from(key.to_string())).unwrap());
+        let store = InMemorySecretsStore::new(crypto);
 
         // No secret stored, should silently skip
         let mut credentials = HashMap::new();
@@ -1486,19 +1602,23 @@ mod tests {
         use std::collections::HashMap;
 
         use crate::secrets::{
-            CreateSecretParams, CredentialLocation, CredentialMapping, SecretsStore,
+            CreateSecretParams, CredentialLocation, CredentialMapping, InMemorySecretsStore,
+            SecretsCrypto, SecretsStore,
         };
         use crate::tools::wasm::capabilities::HttpCapability;
         use crate::tools::wasm::wrapper::{OAuthRefreshConfig, resolve_host_credentials};
+        use secrecy::SecretString;
 
-        let store = test_secrets_store();
+        let key = "0123456789abcdef0123456789abcdef";
+        let crypto = Arc::new(SecretsCrypto::new(SecretString::from(key.to_string())).unwrap());
+        let store = InMemorySecretsStore::new(crypto);
 
         // Store a token that expires 2 hours from now (well within buffer)
         let expires_at = chrono::Utc::now() + chrono::Duration::hours(2);
         store
             .create(
                 "user1",
-                CreateSecretParams::new("google_oauth_token", TEST_GOOGLE_OAUTH_FRESH)
+                CreateSecretParams::new("google_oauth_token", "ya29.fresh-token")
                     .with_expiry(expires_at),
             )
             .await
@@ -1524,8 +1644,8 @@ mod tests {
 
         let oauth_config = OAuthRefreshConfig {
             token_url: "https://oauth2.googleapis.com/token".to_string(),
-            client_id: TEST_OAUTH_CLIENT_ID.to_string(),
-            client_secret: Some(TEST_OAUTH_CLIENT_SECRET.to_string()),
+            client_id: "test-client-id".to_string(),
+            client_secret: Some("test-client-secret".to_string()),
             secret_name: "google_oauth_token".to_string(),
             provider: Some("google".to_string()),
         };
@@ -1536,7 +1656,7 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert_eq!(
             result[0].headers.get("Authorization"),
-            Some(&format!("Bearer {TEST_GOOGLE_OAUTH_FRESH}"))
+            Some(&"Bearer ya29.fresh-token".to_string())
         );
     }
 
@@ -1545,12 +1665,16 @@ mod tests {
         use std::collections::HashMap;
 
         use crate::secrets::{
-            CreateSecretParams, CredentialLocation, CredentialMapping, SecretsStore,
+            CreateSecretParams, CredentialLocation, CredentialMapping, InMemorySecretsStore,
+            SecretsCrypto, SecretsStore,
         };
         use crate::tools::wasm::capabilities::HttpCapability;
         use crate::tools::wasm::wrapper::resolve_host_credentials;
+        use secrecy::SecretString;
 
-        let store = test_secrets_store();
+        let key = "0123456789abcdef0123456789abcdef";
+        let crypto = Arc::new(SecretsCrypto::new(SecretString::from(key.to_string())).unwrap());
+        let store = InMemorySecretsStore::new(crypto);
 
         // Store an expired token
         let expires_at = chrono::Utc::now() - chrono::Duration::hours(1);
@@ -1590,18 +1714,22 @@ mod tests {
         use std::collections::HashMap;
 
         use crate::secrets::{
-            CreateSecretParams, CredentialLocation, CredentialMapping, SecretsStore,
+            CreateSecretParams, CredentialLocation, CredentialMapping, InMemorySecretsStore,
+            SecretsCrypto, SecretsStore,
         };
         use crate::tools::wasm::capabilities::HttpCapability;
         use crate::tools::wasm::wrapper::{OAuthRefreshConfig, resolve_host_credentials};
+        use secrecy::SecretString;
 
-        let store = test_secrets_store();
+        let key = "0123456789abcdef0123456789abcdef";
+        let crypto = Arc::new(SecretsCrypto::new(SecretString::from(key.to_string())).unwrap());
+        let store = InMemorySecretsStore::new(crypto);
 
         // Legacy token: no expires_at set
         store
             .create(
                 "user1",
-                CreateSecretParams::new("google_oauth_token", TEST_GOOGLE_OAUTH_LEGACY),
+                CreateSecretParams::new("google_oauth_token", "ya29.legacy-token"),
             )
             .await
             .unwrap();
@@ -1626,8 +1754,8 @@ mod tests {
 
         let oauth_config = OAuthRefreshConfig {
             token_url: "https://oauth2.googleapis.com/token".to_string(),
-            client_id: TEST_OAUTH_CLIENT_ID.to_string(),
-            client_secret: Some(TEST_OAUTH_CLIENT_SECRET.to_string()),
+            client_id: "test-client-id".to_string(),
+            client_secret: Some("test-client-secret".to_string()),
             secret_name: "google_oauth_token".to_string(),
             provider: Some("google".to_string()),
         };
@@ -1638,7 +1766,7 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert_eq!(
             result[0].headers.get("Authorization"),
-            Some(&format!("Bearer {TEST_GOOGLE_OAUTH_LEGACY}"))
+            Some(&"Bearer ya29.legacy-token".to_string())
         );
     }
 
@@ -1782,58 +1910,5 @@ mod tests {
         let result = super::coerce_params_to_schema(params, &schema);
         // Should remain as string since it can't be parsed
         assert_eq!(result["count"], serde_json::json!("not-a-number"));
-    }
-
-    /// Regression test: leak scan must run on raw headers (before credential
-    /// injection), not after. If it ran post-injection, the host-injected
-    /// Slack bot token (`xoxb-...`) would trigger a Block and reject the
-    /// tool's own legitimate outbound request.
-    #[test]
-    fn test_leak_scan_runs_before_credential_injection() {
-        use crate::safety::LeakDetector;
-
-        // Simulate pre-injection headers: WASM only sees the placeholder, not the real token.
-        let raw_headers: Vec<(String, String)> = vec![
-            (
-                "Authorization".to_string(),
-                "Bearer {SLACK_BOT_TOKEN}".to_string(),
-            ),
-            ("Content-Type".to_string(), "application/json".to_string()),
-        ];
-
-        let detector = LeakDetector::new();
-
-        // Pre-injection scan should pass — placeholders are not secrets.
-        let pre_result = detector.scan_http_request(
-            "https://slack.com/api/chat.postMessage",
-            &raw_headers,
-            None,
-        );
-        assert!(
-            pre_result.is_ok(),
-            "Leak scan on pre-injection headers should pass, but got: {:?}",
-            pre_result
-        );
-
-        // Post-injection headers would contain a real Slack token.
-        let post_injection_headers: Vec<(String, String)> = vec![
-            (
-                "Authorization".to_string(),
-                "Bearer xoxb-1234567890-abcdefghij".to_string(),
-            ),
-            ("Content-Type".to_string(), "application/json".to_string()),
-        ];
-
-        // Post-injection scan WOULD block — this is the false positive
-        // that the pre-injection ordering prevents.
-        let post_result = detector.scan_http_request(
-            "https://slack.com/api/chat.postMessage",
-            &post_injection_headers,
-            None,
-        );
-        assert!(
-            post_result.is_err(),
-            "Leak scan on post-injection headers should block the Slack token"
-        );
     }
 }

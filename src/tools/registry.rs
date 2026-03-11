@@ -64,7 +64,6 @@ const PROTECTED_TOOL_NAMES: &[&str] = &[
     "routine_delete",
     "routine_fire",
     "routine_history",
-    "event_emit",
     "skill_list",
     "skill_search",
     "skill_install",
@@ -137,7 +136,7 @@ impl ToolRegistry {
             return;
         }
         self.tools.write().await.insert(name.clone(), tool);
-        tracing::trace!("Registered tool: {}", name);
+        tracing::debug!("Registered tool: {}", name);
     }
 
     /// Register a tool (sync version for startup, marks as built-in).
@@ -428,8 +427,8 @@ impl ToolRegistry {
         engine: Arc<crate::agent::routine_engine::RoutineEngine>,
     ) {
         use crate::tools::builtin::{
-            EventEmitTool, RoutineCreateTool, RoutineDeleteTool, RoutineFireTool,
-            RoutineHistoryTool, RoutineListTool, RoutineUpdateTool,
+            RoutineCreateTool, RoutineDeleteTool, RoutineFireTool, RoutineHistoryTool,
+            RoutineListTool, RoutineUpdateTool,
         };
         self.register_sync(Arc::new(RoutineCreateTool::new(
             Arc::clone(&store),
@@ -449,8 +448,7 @@ impl ToolRegistry {
             Arc::clone(&engine),
         )));
         self.register_sync(Arc::new(RoutineHistoryTool::new(store)));
-        self.register_sync(Arc::new(EventEmitTool::new(engine)));
-        tracing::debug!("Registered 7 routine management tools");
+        tracing::debug!("Registered 6 routine management tools");
     }
 
     /// Register message tool for sending messages to channels.
@@ -590,6 +588,16 @@ impl ToolRegistry {
 
         // Create the wrapper
         let mut wrapper = WasmToolWrapper::new(Arc::clone(reg.runtime), prepared, reg.capabilities);
+
+        if reg.description.is_none() || reg.schema.is_none() {
+            let (exported_description, exported_schema) = wrapper.exported_metadata()?;
+            if reg.description.is_none() {
+                wrapper = wrapper.with_description(exported_description);
+            }
+            if reg.schema.is_none() {
+                wrapper = wrapper.with_schema(exported_schema);
+            }
+        }
 
         // Apply overrides if provided
         if let Some(desc) = reg.description {
@@ -738,7 +746,62 @@ impl std::fmt::Debug for ToolRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::registry::artifacts::find_wasm_artifact;
     use crate::tools::registry::EchoTool;
+    use std::path::PathBuf;
+    use std::time::Duration;
+
+    use crate::tools::wasm::{ResourceLimits, WasmRuntimeConfig};
+
+    fn github_wasm_artifact() -> Option<PathBuf> {
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        find_wasm_artifact(
+            &repo_root.join("tools-src/github"),
+            "github-tool",
+            "release",
+        )
+    }
+
+    fn wasm_metadata_test_runtime() -> Arc<WasmToolRuntime> {
+        let config = WasmRuntimeConfig {
+            default_limits: ResourceLimits::default()
+                .with_memory(8 * 1024 * 1024)
+                .with_fuel(100_000)
+                .with_timeout(Duration::from_secs(5)),
+            ..WasmRuntimeConfig::for_testing()
+        };
+        Arc::new(WasmToolRuntime::new(config).expect("create wasm runtime"))
+    }
+
+    fn test_extension_manager() -> Arc<ExtensionManager> {
+        use crate::secrets::{InMemorySecretsStore, SecretsCrypto};
+        use crate::tools::mcp::{McpProcessManager, McpSessionManager};
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let tools_dir = dir.path().join("tools");
+        let channels_dir = dir.path().join("channels");
+        std::fs::create_dir_all(&tools_dir).expect("create tools dir");
+        std::fs::create_dir_all(&channels_dir).expect("create channels dir");
+
+        let master_key =
+            secrecy::SecretString::from("0123456789abcdef0123456789abcdef".to_string());
+        let crypto = Arc::new(SecretsCrypto::new(master_key).expect("crypto"));
+
+        Arc::new(ExtensionManager::new(
+            Arc::new(McpSessionManager::new()),
+            Arc::new(McpProcessManager::new()),
+            Arc::new(InMemorySecretsStore::new(crypto)),
+            Arc::new(ToolRegistry::new()),
+            None,
+            None,
+            tools_dir,
+            channels_dir,
+            None,
+            "test".to_string(),
+            None,
+            Vec::new(),
+        ))
+    }
 
     #[tokio::test]
     async fn test_register_and_get() {
@@ -767,6 +830,50 @@ mod tests {
         let defs = registry.tool_definitions().await;
         assert_eq!(defs.len(), 1);
         assert_eq!(defs[0].name, "echo");
+    }
+
+    #[tokio::test]
+    async fn test_explicit_wasm_schema_override_wins_over_exported_metadata() {
+        let Some(wasm_path) = github_wasm_artifact() else {
+            eprintln!("Skipping override precedence regression: github WASM artifact not built");
+            return;
+        };
+
+        let registry = ToolRegistry::new();
+        let runtime = wasm_metadata_test_runtime();
+        let wasm_bytes = std::fs::read(&wasm_path).expect("read github wasm");
+        let override_schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "forced": { "type": "string" }
+            },
+            "required": ["forced"],
+            "additionalProperties": false
+        });
+
+        registry
+            .register_wasm(WasmToolRegistration {
+                name: "github_override",
+                wasm_bytes: &wasm_bytes,
+                runtime: &runtime,
+                capabilities: Capabilities::default(),
+                limits: None,
+                description: Some("forced description"),
+                schema: Some(override_schema.clone()),
+                secrets_store: None,
+                oauth_refresh: None,
+            })
+            .await
+            .expect("register wasm with schema override");
+
+        let defs = registry.tool_definitions().await;
+        let github = defs
+            .iter()
+            .find(|def| def.name == "github_override")
+            .expect("github_override tool definition");
+
+        assert_eq!(github.parameters, override_schema);
+        assert_eq!(github.description, "forced description");
     }
 
     #[tokio::test]
@@ -924,5 +1031,28 @@ mod tests {
         registry.retain_only(&[]).await;
         let after = registry.list().await.len();
         assert_eq!(before, after);
+    }
+
+    #[tokio::test]
+    async fn test_register_extension_tools_registers_expected_names() {
+        let registry = ToolRegistry::new();
+        registry.register_extension_tools(test_extension_manager());
+
+        let mut names = registry.list().await;
+        names.sort();
+
+        assert_eq!(
+            names,
+            vec![
+                "extension_info",
+                "tool_activate",
+                "tool_auth",
+                "tool_install",
+                "tool_list",
+                "tool_remove",
+                "tool_search",
+                "tool_upgrade",
+            ]
+        );
     }
 }
