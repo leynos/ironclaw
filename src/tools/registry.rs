@@ -241,7 +241,7 @@ impl ToolRegistry {
         }
         self.register_sync(Arc::new(http));
 
-        tracing::info!("Registered {} built-in tools", self.count());
+        tracing::debug!("Registered {} built-in tools", self.count());
     }
 
     /// Register only orchestrator-domain tools (safe for the main process).
@@ -289,7 +289,7 @@ impl ToolRegistry {
         self.register_sync(Arc::new(ListDirTool::new()));
         self.register_sync(Arc::new(ApplyPatchTool::new()));
 
-        tracing::info!("Registered 5 development tools");
+        tracing::debug!("Registered 5 development tools");
     }
 
     /// Register memory tools with a workspace.
@@ -302,7 +302,7 @@ impl ToolRegistry {
         self.register_sync(Arc::new(MemoryReadTool::new(Arc::clone(&workspace))));
         self.register_sync(Arc::new(MemoryTreeTool::new(workspace)));
 
-        tracing::info!("Registered 4 memory tools");
+        tracing::debug!("Registered 4 memory tools");
     }
 
     /// Register job management tools.
@@ -364,7 +364,7 @@ impl ToolRegistry {
             job_tool_count += 1;
         }
 
-        tracing::info!("Registered {} job management tools", job_tool_count);
+        tracing::debug!("Registered {} job management tools", job_tool_count);
     }
 
     /// Register secret management tools (list, delete).
@@ -378,7 +378,7 @@ impl ToolRegistry {
         use crate::tools::builtin::{SecretDeleteTool, SecretListTool};
         self.register_sync(Arc::new(SecretListTool::new(Arc::clone(&store))));
         self.register_sync(Arc::new(SecretDeleteTool::new(store)));
-        tracing::info!("Registered 2 secret management tools (list, delete)");
+        tracing::debug!("Registered 2 secret management tools (list, delete)");
     }
 
     /// Register extension management tools (search, install, auth, activate, list, remove).
@@ -393,7 +393,7 @@ impl ToolRegistry {
         self.register_sync(Arc::new(ToolRemoveTool::new(Arc::clone(&manager))));
         self.register_sync(Arc::new(ToolUpgradeTool::new(Arc::clone(&manager))));
         self.register_sync(Arc::new(ExtensionInfoTool::new(manager)));
-        tracing::info!("Registered 8 extension management tools");
+        tracing::debug!("Registered 8 extension management tools");
     }
 
     /// Register skill management tools (list, search, install, remove).
@@ -414,7 +414,7 @@ impl ToolRegistry {
             Arc::clone(&catalog),
         )));
         self.register_sync(Arc::new(SkillRemoveTool::new(registry)));
-        tracing::info!("Registered 4 skill management tools");
+        tracing::debug!("Registered 4 skill management tools");
     }
 
     /// Register routine management tools.
@@ -427,8 +427,8 @@ impl ToolRegistry {
         engine: Arc<crate::agent::routine_engine::RoutineEngine>,
     ) {
         use crate::tools::builtin::{
-            RoutineCreateTool, RoutineDeleteTool, RoutineFireTool, RoutineHistoryTool,
-            RoutineListTool, RoutineUpdateTool,
+            EventEmitTool, RoutineCreateTool, RoutineDeleteTool, RoutineFireTool,
+            RoutineHistoryTool, RoutineListTool, RoutineUpdateTool,
         };
         self.register_sync(Arc::new(RoutineCreateTool::new(
             Arc::clone(&store),
@@ -448,7 +448,8 @@ impl ToolRegistry {
             Arc::clone(&engine),
         )));
         self.register_sync(Arc::new(RoutineHistoryTool::new(store)));
-        tracing::info!("Registered 6 routine management tools");
+        self.register_sync(Arc::new(EventEmitTool::new(engine)));
+        tracing::debug!("Registered 7 routine management tools");
     }
 
     /// Register message tool for sending messages to channels.
@@ -467,7 +468,7 @@ impl ToolRegistry {
             .write()
             .await
             .insert("message".to_string());
-        tracing::info!("Registered message tool");
+        tracing::debug!("Registered message tool");
     }
 
     /// Set the default channel and target for the message tool.
@@ -501,7 +502,7 @@ impl ToolRegistry {
             gen_model,
             base_dir,
         )));
-        tracing::info!("Registered 2 image tools (generate, edit)");
+        tracing::debug!("Registered 2 image tools (generate, edit)");
     }
 
     /// Register vision/image analysis tools.
@@ -521,7 +522,7 @@ impl ToolRegistry {
             vision_model,
             base_dir,
         )));
-        tracing::info!("Registered 1 vision tool (analyze)");
+        tracing::debug!("Registered 1 vision tool (analyze)");
     }
 
     /// Register the software builder tool.
@@ -549,7 +550,7 @@ impl ToolRegistry {
         self.register(Arc::new(BuildSoftwareTool::new(builder)))
             .await;
 
-        tracing::info!("Registered software builder tool");
+        tracing::debug!("Registered software builder tool");
     }
 
     /// Register a WASM tool from bytes.
@@ -589,6 +590,16 @@ impl ToolRegistry {
         // Create the wrapper
         let mut wrapper = WasmToolWrapper::new(Arc::clone(reg.runtime), prepared, reg.capabilities);
 
+        if reg.description.is_none() || reg.schema.is_none() {
+            let (exported_description, exported_schema) = wrapper.exported_metadata()?;
+            if reg.description.is_none() {
+                wrapper = wrapper.with_description(exported_description);
+            }
+            if reg.schema.is_none() {
+                wrapper = wrapper.with_schema(exported_schema);
+            }
+        }
+
         // Apply overrides if provided
         if let Some(desc) = reg.description {
             wrapper = wrapper.with_description(desc);
@@ -619,7 +630,7 @@ impl ToolRegistry {
             );
         }
 
-        tracing::info!(name = reg.name, "Registered WASM tool");
+        tracing::debug!(name = reg.name, "Registered WASM tool");
         Ok(())
     }
 
@@ -676,7 +687,7 @@ impl ToolRegistry {
         .await
         .map_err(WasmRegistrationError::Wasm)?;
 
-        tracing::info!(
+        tracing::debug!(
             name = tool_with_binary.tool.name,
             user_id = user_id,
             trust_level = %tool_with_binary.tool.trust_level,
@@ -736,7 +747,62 @@ impl std::fmt::Debug for ToolRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::registry::artifacts::find_wasm_artifact;
     use crate::tools::registry::EchoTool;
+    use std::path::PathBuf;
+    use std::time::Duration;
+
+    use crate::tools::wasm::{ResourceLimits, WasmRuntimeConfig};
+
+    fn github_wasm_artifact() -> Option<PathBuf> {
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        find_wasm_artifact(
+            &repo_root.join("tools-src/github"),
+            "github-tool",
+            "release",
+        )
+    }
+
+    fn wasm_metadata_test_runtime() -> Arc<WasmToolRuntime> {
+        let config = WasmRuntimeConfig {
+            default_limits: ResourceLimits::default()
+                .with_memory(8 * 1024 * 1024)
+                .with_fuel(100_000)
+                .with_timeout(Duration::from_secs(5)),
+            ..WasmRuntimeConfig::for_testing()
+        };
+        Arc::new(WasmToolRuntime::new(config).expect("create wasm runtime"))
+    }
+
+    fn test_extension_manager() -> Arc<ExtensionManager> {
+        use crate::secrets::{InMemorySecretsStore, SecretsCrypto};
+        use crate::tools::mcp::{McpProcessManager, McpSessionManager};
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let tools_dir = dir.path().join("tools");
+        let channels_dir = dir.path().join("channels");
+        std::fs::create_dir_all(&tools_dir).expect("create tools dir");
+        std::fs::create_dir_all(&channels_dir).expect("create channels dir");
+
+        let master_key =
+            secrecy::SecretString::from("0123456789abcdef0123456789abcdef".to_string());
+        let crypto = Arc::new(SecretsCrypto::new(master_key).expect("crypto"));
+
+        Arc::new(ExtensionManager::new(
+            Arc::new(McpSessionManager::new()),
+            Arc::new(McpProcessManager::new()),
+            Arc::new(InMemorySecretsStore::new(crypto)),
+            Arc::new(ToolRegistry::new()),
+            None,
+            None,
+            tools_dir,
+            channels_dir,
+            None,
+            "test".to_string(),
+            None,
+            Vec::new(),
+        ))
+    }
 
     #[tokio::test]
     async fn test_register_and_get() {
@@ -765,6 +831,50 @@ mod tests {
         let defs = registry.tool_definitions().await;
         assert_eq!(defs.len(), 1);
         assert_eq!(defs[0].name, "echo");
+    }
+
+    #[tokio::test]
+    async fn test_explicit_wasm_schema_override_wins_over_exported_metadata() {
+        let Some(wasm_path) = github_wasm_artifact() else {
+            eprintln!("Skipping override precedence regression: github WASM artifact not built");
+            return;
+        };
+
+        let registry = ToolRegistry::new();
+        let runtime = wasm_metadata_test_runtime();
+        let wasm_bytes = std::fs::read(&wasm_path).expect("read github wasm");
+        let override_schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "forced": { "type": "string" }
+            },
+            "required": ["forced"],
+            "additionalProperties": false
+        });
+
+        registry
+            .register_wasm(WasmToolRegistration {
+                name: "github_override",
+                wasm_bytes: &wasm_bytes,
+                runtime: &runtime,
+                capabilities: Capabilities::default(),
+                limits: None,
+                description: Some("forced description"),
+                schema: Some(override_schema.clone()),
+                secrets_store: None,
+                oauth_refresh: None,
+            })
+            .await
+            .expect("register wasm with schema override");
+
+        let defs = registry.tool_definitions().await;
+        let github = defs
+            .iter()
+            .find(|def| def.name == "github_override")
+            .expect("github_override tool definition");
+
+        assert_eq!(github.parameters, override_schema);
+        assert_eq!(github.description, "forced description");
     }
 
     #[tokio::test]
@@ -922,5 +1032,28 @@ mod tests {
         registry.retain_only(&[]).await;
         let after = registry.list().await.len();
         assert_eq!(before, after);
+    }
+
+    #[tokio::test]
+    async fn test_register_extension_tools_registers_expected_names() {
+        let registry = ToolRegistry::new();
+        registry.register_extension_tools(test_extension_manager());
+
+        let mut names = registry.list().await;
+        names.sort();
+
+        assert_eq!(
+            names,
+            vec![
+                "extension_info",
+                "tool_activate",
+                "tool_auth",
+                "tool_install",
+                "tool_list",
+                "tool_remove",
+                "tool_search",
+                "tool_upgrade",
+            ]
+        );
     }
 }

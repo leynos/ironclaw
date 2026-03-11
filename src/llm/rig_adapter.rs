@@ -19,7 +19,6 @@ use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use serde_json::Value as JsonValue;
 
 use std::collections::HashSet;
 
@@ -30,6 +29,7 @@ use crate::llm::provider::{
     ToolCall as IronToolCall, ToolCompletionRequest, ToolCompletionResponse,
     ToolDefinition as IronToolDefinition,
 };
+use crate::llm::schema_normalize::normalize_schema_strict;
 
 /// Adapter that wraps a rig-core `CompletionModel` and implements `LlmProvider`.
 pub struct RigAdapter<M: CompletionModel> {
@@ -42,6 +42,9 @@ pub struct RigAdapter<M: CompletionModel> {
     /// via `additional_params` for Anthropic automatic caching. Also controls
     /// the cost multiplier for cache-creation tokens.
     cache_retention: CacheRetention,
+    /// Parameter names that this provider does not support (e.g., `"temperature"`).
+    /// These are stripped from requests before sending to avoid 400 errors.
+    unsupported_params: HashSet<String>,
 }
 
 impl<M: CompletionModel> RigAdapter<M> {
@@ -56,6 +59,7 @@ impl<M: CompletionModel> RigAdapter<M> {
             input_cost,
             output_cost,
             cache_retention: CacheRetention::None,
+            unsupported_params: HashSet::new(),
         }
     }
 
@@ -84,163 +88,43 @@ impl<M: CompletionModel> RigAdapter<M> {
         }
         self
     }
-}
 
-// -- Type conversion helpers --
+    /// Set the list of unsupported parameter names for this provider.
+    ///
+    /// Parameters in this set are stripped from requests before sending.
+    /// Supported parameter names: `"temperature"`, `"max_tokens"`, `"stop_sequences"`.
+    pub fn with_unsupported_params(mut self, params: Vec<String>) -> Self {
+        self.unsupported_params = params.into_iter().collect();
+        self
+    }
 
-/// Normalize a JSON Schema for OpenAI strict mode compliance.
-///
-/// OpenAI strict function calling requires:
-/// - Every object must have `"additionalProperties": false`
-/// - `"required"` must list ALL property keys
-/// - Optional fields use `"type": ["<original>", "null"]` instead of being omitted from `required`
-/// - Nested objects and array items are recursively normalized
-///
-/// This is applied as a clone-and-transform at the provider boundary so the
-/// original tool definitions remain unchanged for other providers.
-fn normalize_schema_strict(schema: &JsonValue) -> JsonValue {
-    let mut schema = schema.clone();
-    normalize_schema_recursive(&mut schema);
-    schema
-}
-
-fn normalize_schema_recursive(schema: &mut JsonValue) {
-    let obj = match schema.as_object_mut() {
-        Some(o) => o,
-        None => return,
-    };
-
-    // Recurse into combinators: anyOf, oneOf, allOf
-    for key in &["anyOf", "oneOf", "allOf"] {
-        if let Some(JsonValue::Array(variants)) = obj.get_mut(*key) {
-            for variant in variants.iter_mut() {
-                normalize_schema_recursive(variant);
-            }
+    /// Strip unsupported fields from a `CompletionRequest` in place.
+    fn strip_unsupported_completion_params(&self, req: &mut CompletionRequest) {
+        if self.unsupported_params.is_empty() {
+            return;
+        }
+        if self.unsupported_params.contains("temperature") {
+            req.temperature = None;
+        }
+        if self.unsupported_params.contains("max_tokens") {
+            req.max_tokens = None;
+        }
+        if self.unsupported_params.contains("stop_sequences") {
+            req.stop_sequences = None;
         }
     }
 
-    // Recurse into array items
-    if let Some(items) = obj.get_mut("items") {
-        normalize_schema_recursive(items);
-    }
-
-    // Recurse into `not`, `if`, `then`, `else`
-    for key in &["not", "if", "then", "else"] {
-        if let Some(sub) = obj.get_mut(*key) {
-            normalize_schema_recursive(sub);
+    /// Strip unsupported fields from a `ToolCompletionRequest` in place.
+    fn strip_unsupported_tool_params(&self, req: &mut ToolCompletionRequest) {
+        if self.unsupported_params.is_empty() {
+            return;
         }
-    }
-
-    // Only apply object-level normalization if this schema has "properties"
-    // (explicit object schema) or type == "object"
-    let is_object = obj
-        .get("type")
-        .and_then(|t| t.as_str())
-        .map(|t| t == "object")
-        .unwrap_or(false);
-    let has_properties = obj.contains_key("properties");
-
-    if !is_object && !has_properties {
-        return;
-    }
-
-    // Ensure "type": "object" is present
-    if !obj.contains_key("type") && has_properties {
-        obj.insert("type".to_string(), JsonValue::String("object".to_string()));
-    }
-
-    // Force additionalProperties: false (overwrite any existing value)
-    obj.insert("additionalProperties".to_string(), JsonValue::Bool(false));
-
-    // Ensure "properties" exists
-    if !obj.contains_key("properties") {
-        obj.insert(
-            "properties".to_string(),
-            JsonValue::Object(serde_json::Map::new()),
-        );
-    }
-
-    // Collect current required set
-    let current_required: std::collections::HashSet<String> = obj
-        .get("required")
-        .and_then(|r| r.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
-
-    // Get all property keys (sorted for deterministic output)
-    let all_keys: Vec<String> = obj
-        .get("properties")
-        .and_then(|p| p.as_object())
-        .map(|props| {
-            let mut keys: Vec<String> = props.keys().cloned().collect();
-            keys.sort();
-            keys
-        })
-        .unwrap_or_default();
-
-    // For properties NOT in the original required list, make them nullable
-    if let Some(JsonValue::Object(props)) = obj.get_mut("properties") {
-        for key in &all_keys {
-            // Recurse into each property's schema FIRST (before make_nullable,
-            // which may change the type to an array and prevent object detection)
-            if let Some(prop_schema) = props.get_mut(key) {
-                normalize_schema_recursive(prop_schema);
-            }
-            // Then make originally-optional properties nullable
-            if !current_required.contains(key)
-                && let Some(prop_schema) = props.get_mut(key)
-            {
-                make_nullable(prop_schema);
-            }
+        if self.unsupported_params.contains("temperature") {
+            req.temperature = None;
         }
-    }
-
-    // Set required to ALL property keys
-    let required_value: Vec<JsonValue> = all_keys.into_iter().map(JsonValue::String).collect();
-    obj.insert("required".to_string(), JsonValue::Array(required_value));
-}
-
-/// Make a property schema nullable for OpenAI strict mode.
-///
-/// If it has a simple `"type": "<T>"`, converts to `"type": ["<T>", "null"]`.
-/// If it already has an array type, adds "null" if not present.
-/// Otherwise, wraps with `anyOf: [<existing>, {"type": "null"}]`.
-fn make_nullable(schema: &mut JsonValue) {
-    let obj = match schema.as_object_mut() {
-        Some(o) => o,
-        None => return,
-    };
-
-    if let Some(type_val) = obj.get("type").cloned() {
-        match type_val {
-            // "type": "string" → "type": ["string", "null"]
-            JsonValue::String(ref t) if t != "null" => {
-                obj.insert("type".to_string(), serde_json::json!([t, "null"]));
-            }
-            // "type": ["string", "integer"] → add "null" if missing
-            JsonValue::Array(ref arr) => {
-                let has_null = arr.iter().any(|v| v.as_str() == Some("null"));
-                if !has_null {
-                    let mut new_arr = arr.clone();
-                    new_arr.push(JsonValue::String("null".to_string()));
-                    obj.insert("type".to_string(), JsonValue::Array(new_arr));
-                }
-            }
-            _ => {}
+        if self.unsupported_params.contains("max_tokens") {
+            req.max_tokens = None;
         }
-    } else {
-        // No "type" key — wrap with anyOf including null
-        // (handles enum-only, $ref, or combinator schemas)
-        let existing = JsonValue::Object(obj.clone());
-        obj.clear();
-        obj.insert(
-            "anyOf".to_string(),
-            serde_json::json!([existing, {"type": "null"}]),
-        );
     }
 }
 
@@ -539,7 +423,10 @@ where
         }
     }
 
-    async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse, LlmError> {
+    async fn complete(
+        &self,
+        mut request: CompletionRequest,
+    ) -> Result<CompletionResponse, LlmError> {
         if let Some(requested_model) = request.model.as_deref()
             && requested_model != self.model_name.as_str()
         {
@@ -549,6 +436,8 @@ where
                 "Per-request model override is not supported for this provider; using configured model"
             );
         }
+
+        self.strip_unsupported_completion_params(&mut request);
 
         let mut messages = request.messages;
         crate::llm::provider::sanitize_tool_messages(&mut messages);
@@ -599,7 +488,7 @@ where
 
     async fn complete_with_tools(
         &self,
-        request: ToolCompletionRequest,
+        mut request: ToolCompletionRequest,
     ) -> Result<ToolCompletionResponse, LlmError> {
         if let Some(requested_model) = request.model.as_deref()
             && requested_model != self.model_name.as_str()
@@ -610,6 +499,8 @@ where
                 "Per-request model override is not supported for this provider; using configured model"
             );
         }
+
+        self.strip_unsupported_tool_params(&mut request);
 
         let known_tool_names: HashSet<String> =
             request.tools.iter().map(|t| t.name.clone()).collect();
@@ -719,6 +610,8 @@ fn normalize_tool_name(name: &str, known_tools: &HashSet<String>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::llm::test_fixtures::github_style_schema;
+    use serde_json::Value as JsonValue;
 
     #[test]
     fn test_convert_messages_system_to_preamble() {
@@ -830,6 +723,33 @@ mod tests {
         assert_eq!(rig_tools.len(), 1);
         assert_eq!(rig_tools[0].name, "search");
         assert_eq!(rig_tools[0].description, "Search the web");
+    }
+
+    #[test]
+    fn test_convert_tools_rewrites_github_style_schema_before_provider_submission() {
+        let github_style_schema: JsonValue = github_style_schema();
+        let tools = vec![IronToolDefinition {
+            name: "github".to_string(),
+            description: "GitHub integration".to_string(),
+            parameters: github_style_schema,
+        }];
+
+        let rig_tools = convert_tools(&tools);
+        let parameters = &rig_tools[0].parameters;
+
+        assert_eq!(rig_tools[0].name, "github");
+        assert!(
+            parameters.get("oneOf").is_none(),
+            "provider-facing schema must not keep top-level oneOf: {parameters}"
+        );
+        assert_eq!(
+            parameters["required"],
+            serde_json::json!(["action", "owner", "repo", "title"])
+        );
+        assert_eq!(
+            parameters["properties"]["action"]["enum"],
+            serde_json::json!(["create_issue", "get_repo"])
+        );
     }
 
     #[test]
@@ -1155,5 +1075,98 @@ mod tests {
         // Non-Claude models
         assert!(!supports_prompt_cache("gpt-4o"));
         assert!(!supports_prompt_cache("llama3"));
+    }
+
+    #[test]
+    fn test_with_unsupported_params_populates_set() {
+        use rig::client::CompletionClient;
+        use rig::providers::openai;
+
+        let client: openai::Client = openai::Client::builder()
+            .api_key("test-key")
+            .base_url("http://localhost:0")
+            .build()
+            .unwrap();
+        let client = client.completions_api();
+        let model = client.completion_model("test-model");
+        let adapter = RigAdapter::new(model, "test-model")
+            .with_unsupported_params(vec!["temperature".to_string()]);
+
+        assert!(adapter.unsupported_params.contains("temperature"));
+        assert!(!adapter.unsupported_params.contains("max_tokens"));
+    }
+
+    #[test]
+    fn test_strip_unsupported_completion_params() {
+        use rig::client::CompletionClient;
+        use rig::providers::openai;
+
+        let client: openai::Client = openai::Client::builder()
+            .api_key("test-key")
+            .base_url("http://localhost:0")
+            .build()
+            .unwrap();
+        let client = client.completions_api();
+        let model = client.completion_model("test-model");
+        let adapter = RigAdapter::new(model, "test-model").with_unsupported_params(vec![
+            "temperature".to_string(),
+            "stop_sequences".to_string(),
+        ]);
+
+        let mut req = CompletionRequest::new(vec![ChatMessage::user("hi")]);
+        req.temperature = Some(0.7);
+        req.max_tokens = Some(100);
+        req.stop_sequences = Some(vec!["STOP".to_string()]);
+
+        adapter.strip_unsupported_completion_params(&mut req);
+
+        assert!(req.temperature.is_none(), "temperature should be stripped");
+        assert_eq!(req.max_tokens, Some(100), "max_tokens should be preserved");
+        assert!(
+            req.stop_sequences.is_none(),
+            "stop_sequences should be stripped"
+        );
+    }
+
+    #[test]
+    fn test_strip_unsupported_tool_params() {
+        use rig::client::CompletionClient;
+        use rig::providers::openai;
+
+        let client: openai::Client = openai::Client::builder()
+            .api_key("test-key")
+            .base_url("http://localhost:0")
+            .build()
+            .unwrap();
+        let client = client.completions_api();
+        let model = client.completion_model("test-model");
+        let adapter = RigAdapter::new(model, "test-model")
+            .with_unsupported_params(vec!["temperature".to_string(), "max_tokens".to_string()]);
+
+        let mut req = ToolCompletionRequest::new(vec![ChatMessage::user("hi")], vec![]);
+        req.temperature = Some(0.5);
+        req.max_tokens = Some(200);
+
+        adapter.strip_unsupported_tool_params(&mut req);
+
+        assert!(req.temperature.is_none(), "temperature should be stripped");
+        assert!(req.max_tokens.is_none(), "max_tokens should be stripped");
+    }
+
+    #[test]
+    fn test_unsupported_params_empty_by_default() {
+        use rig::client::CompletionClient;
+        use rig::providers::openai;
+
+        let client: openai::Client = openai::Client::builder()
+            .api_key("test-key")
+            .base_url("http://localhost:0")
+            .build()
+            .unwrap();
+        let client = client.completions_api();
+        let model = client.completion_model("test-model");
+        let adapter = RigAdapter::new(model, "test-model");
+
+        assert!(adapter.unsupported_params.is_empty());
     }
 }
