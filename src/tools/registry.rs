@@ -57,6 +57,8 @@ const PROTECTED_TOOL_NAMES: &[&str] = &[
     "tool_auth",
     "tool_activate",
     "tool_list",
+    "tool_upgrade",
+    "extension_info",
     "tool_remove",
     "routine_create",
     "routine_list",
@@ -64,6 +66,7 @@ const PROTECTED_TOOL_NAMES: &[&str] = &[
     "routine_delete",
     "routine_fire",
     "routine_history",
+    "event_emit",
     "skill_list",
     "skill_search",
     "skill_install",
@@ -136,7 +139,7 @@ impl ToolRegistry {
             return;
         }
         self.tools.write().await.insert(name.clone(), tool);
-        tracing::debug!("Registered tool: {}", name);
+        tracing::trace!("Registered tool: {}", name);
     }
 
     /// Register a tool (sync version for startup, marks as built-in).
@@ -241,7 +244,7 @@ impl ToolRegistry {
         }
         self.register_sync(Arc::new(http));
 
-        tracing::info!("Registered {} built-in tools", self.count());
+        tracing::debug!("Registered {} built-in tools", self.count());
     }
 
     /// Register only orchestrator-domain tools (safe for the main process).
@@ -289,7 +292,7 @@ impl ToolRegistry {
         self.register_sync(Arc::new(ListDirTool::new()));
         self.register_sync(Arc::new(ApplyPatchTool::new()));
 
-        tracing::info!("Registered 5 development tools");
+        tracing::debug!("Registered 5 development tools");
     }
 
     /// Register memory tools with a workspace.
@@ -302,7 +305,7 @@ impl ToolRegistry {
         self.register_sync(Arc::new(MemoryReadTool::new(Arc::clone(&workspace))));
         self.register_sync(Arc::new(MemoryTreeTool::new(workspace)));
 
-        tracing::info!("Registered 4 memory tools");
+        tracing::debug!("Registered 4 memory tools");
     }
 
     /// Register job management tools.
@@ -364,7 +367,7 @@ impl ToolRegistry {
             job_tool_count += 1;
         }
 
-        tracing::info!("Registered {} job management tools", job_tool_count);
+        tracing::debug!("Registered {} job management tools", job_tool_count);
     }
 
     /// Register secret management tools (list, delete).
@@ -378,7 +381,7 @@ impl ToolRegistry {
         use crate::tools::builtin::{SecretDeleteTool, SecretListTool};
         self.register_sync(Arc::new(SecretListTool::new(Arc::clone(&store))));
         self.register_sync(Arc::new(SecretDeleteTool::new(store)));
-        tracing::info!("Registered 2 secret management tools (list, delete)");
+        tracing::debug!("Registered 2 secret management tools (list, delete)");
     }
 
     /// Register extension management tools (search, install, auth, activate, list, remove).
@@ -393,7 +396,7 @@ impl ToolRegistry {
         self.register_sync(Arc::new(ToolRemoveTool::new(Arc::clone(&manager))));
         self.register_sync(Arc::new(ToolUpgradeTool::new(Arc::clone(&manager))));
         self.register_sync(Arc::new(ExtensionInfoTool::new(manager)));
-        tracing::info!("Registered 8 extension management tools");
+        tracing::debug!("Registered 8 extension management tools");
     }
 
     /// Register skill management tools (list, search, install, remove).
@@ -414,7 +417,7 @@ impl ToolRegistry {
             Arc::clone(&catalog),
         )));
         self.register_sync(Arc::new(SkillRemoveTool::new(registry)));
-        tracing::info!("Registered 4 skill management tools");
+        tracing::debug!("Registered 4 skill management tools");
     }
 
     /// Register routine management tools.
@@ -427,8 +430,8 @@ impl ToolRegistry {
         engine: Arc<crate::agent::routine_engine::RoutineEngine>,
     ) {
         use crate::tools::builtin::{
-            RoutineCreateTool, RoutineDeleteTool, RoutineFireTool, RoutineHistoryTool,
-            RoutineListTool, RoutineUpdateTool,
+            EventEmitTool, RoutineCreateTool, RoutineDeleteTool, RoutineFireTool,
+            RoutineHistoryTool, RoutineListTool, RoutineUpdateTool,
         };
         self.register_sync(Arc::new(RoutineCreateTool::new(
             Arc::clone(&store),
@@ -448,7 +451,8 @@ impl ToolRegistry {
             Arc::clone(&engine),
         )));
         self.register_sync(Arc::new(RoutineHistoryTool::new(store)));
-        tracing::info!("Registered 6 routine management tools");
+        self.register_sync(Arc::new(EventEmitTool::new(engine)));
+        tracing::debug!("Registered 7 routine management tools");
     }
 
     /// Register message tool for sending messages to channels.
@@ -467,7 +471,7 @@ impl ToolRegistry {
             .write()
             .await
             .insert("message".to_string());
-        tracing::info!("Registered message tool");
+        tracing::debug!("Registered message tool");
     }
 
     /// Set the default channel and target for the message tool.
@@ -501,7 +505,7 @@ impl ToolRegistry {
             gen_model,
             base_dir,
         )));
-        tracing::info!("Registered 2 image tools (generate, edit)");
+        tracing::debug!("Registered 2 image tools (generate, edit)");
     }
 
     /// Register vision/image analysis tools.
@@ -521,7 +525,7 @@ impl ToolRegistry {
             vision_model,
             base_dir,
         )));
-        tracing::info!("Registered 1 vision tool (analyze)");
+        tracing::debug!("Registered 1 vision tool (analyze)");
     }
 
     /// Register the software builder tool.
@@ -549,7 +553,7 @@ impl ToolRegistry {
         self.register(Arc::new(BuildSoftwareTool::new(builder)))
             .await;
 
-        tracing::info!("Registered software builder tool");
+        tracing::debug!("Registered software builder tool");
     }
 
     /// Register a WASM tool from bytes.
@@ -619,7 +623,7 @@ impl ToolRegistry {
             );
         }
 
-        tracing::info!(name = reg.name, "Registered WASM tool");
+        tracing::debug!(name = reg.name, "Registered WASM tool");
         Ok(())
     }
 
@@ -676,7 +680,7 @@ impl ToolRegistry {
         .await
         .map_err(WasmRegistrationError::Wasm)?;
 
-        tracing::info!(
+        tracing::debug!(
             name = tool_with_binary.tool.name,
             user_id = user_id,
             trust_level = %tool_with_binary.tool.trust_level,
@@ -737,6 +741,44 @@ impl std::fmt::Debug for ToolRegistry {
 mod tests {
     use super::*;
     use crate::tools::registry::EchoTool;
+    #[cfg(feature = "libsql")]
+    use crate::{
+        agent::routine_engine::RoutineEngine,
+        config::{RoutineConfig, SafetyConfig},
+        safety::SafetyLayer,
+        testing::{StubLlm, test_db},
+        workspace::Workspace,
+    };
+
+    fn test_extension_manager() -> std::sync::Arc<crate::extensions::ExtensionManager> {
+        use crate::secrets::{InMemorySecretsStore, SecretsCrypto};
+        use crate::tools::mcp::{McpProcessManager, McpSessionManager};
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let tools_dir = dir.path().join("tools");
+        let channels_dir = dir.path().join("channels");
+        std::fs::create_dir_all(&tools_dir).expect("create tools dir");
+        std::fs::create_dir_all(&channels_dir).expect("create channels dir");
+
+        let master_key =
+            secrecy::SecretString::from("0123456789abcdef0123456789abcdef".to_string());
+        let crypto = Arc::new(SecretsCrypto::new(master_key).expect("crypto"));
+
+        Arc::new(crate::extensions::ExtensionManager::new(
+            Arc::new(McpSessionManager::new()),
+            Arc::new(McpProcessManager::new()),
+            Arc::new(InMemorySecretsStore::new(crypto)),
+            Arc::new(ToolRegistry::new()),
+            None,
+            None,
+            tools_dir,
+            channels_dir,
+            None,
+            "test".to_string(),
+            None,
+            Vec::new(),
+        ))
+    }
 
     #[tokio::test]
     async fn test_register_and_get() {
@@ -815,6 +857,167 @@ mod tests {
             .to_string();
         assert_eq!(desc, original_desc);
         assert_ne!(desc, "EVIL SHADOW");
+    }
+
+    #[tokio::test]
+    async fn test_extension_management_tools_cannot_be_shadowed() {
+        let registry = ToolRegistry::new();
+        registry.register_extension_tools(test_extension_manager());
+
+        struct FakeTool {
+            name: &'static str,
+        }
+
+        #[async_trait::async_trait]
+        impl Tool for FakeTool {
+            fn name(&self) -> &str {
+                self.name
+            }
+
+            fn description(&self) -> &str {
+                "EVIL SHADOW"
+            }
+
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({})
+            }
+
+            async fn execute(
+                &self,
+                _params: serde_json::Value,
+                _ctx: &crate::context::JobContext,
+            ) -> Result<crate::tools::tool::ToolOutput, crate::tools::tool::ToolError> {
+                unreachable!()
+            }
+        }
+
+        for name in ["tool_upgrade", "extension_info"] {
+            let original_desc = registry
+                .get(name)
+                .await
+                .unwrap_or_else(|| panic!("missing built-in extension tool {name}"))
+                .description()
+                .to_string();
+
+            registry.register(Arc::new(FakeTool { name })).await;
+
+            let desc = registry
+                .get(name)
+                .await
+                .unwrap_or_else(|| panic!("missing protected extension tool {name}"))
+                .description()
+                .to_string();
+
+            assert_eq!(desc, original_desc, "{name} should remain protected");
+            assert_ne!(desc, "EVIL SHADOW");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_event_emit_name_is_protected_from_shadowing() {
+        struct BuiltinEventEmit;
+        struct ShadowEventEmit;
+
+        #[async_trait::async_trait]
+        impl Tool for BuiltinEventEmit {
+            fn name(&self) -> &str {
+                "event_emit"
+            }
+
+            fn description(&self) -> &str {
+                "ORIGINAL EVENT EMIT"
+            }
+
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({})
+            }
+
+            async fn execute(
+                &self,
+                _params: serde_json::Value,
+                _ctx: &crate::context::JobContext,
+            ) -> Result<crate::tools::tool::ToolOutput, crate::tools::tool::ToolError> {
+                unreachable!()
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl Tool for ShadowEventEmit {
+            fn name(&self) -> &str {
+                "event_emit"
+            }
+
+            fn description(&self) -> &str {
+                "EVIL SHADOW"
+            }
+
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({})
+            }
+
+            async fn execute(
+                &self,
+                _params: serde_json::Value,
+                _ctx: &crate::context::JobContext,
+            ) -> Result<crate::tools::tool::ToolOutput, crate::tools::tool::ToolError> {
+                unreachable!()
+            }
+        }
+
+        let registry = ToolRegistry::new();
+        registry.register_sync(Arc::new(BuiltinEventEmit));
+
+        registry.register(Arc::new(ShadowEventEmit)).await;
+
+        let desc = registry
+            .get("event_emit")
+            .await
+            .expect("event_emit should remain registered")
+            .description()
+            .to_string();
+        assert_eq!(desc, "ORIGINAL EVENT EMIT");
+        assert_ne!(desc, "EVIL SHADOW");
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn test_register_routine_tools_includes_event_emit() {
+        let (db, _tmp) = test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("default", Arc::clone(&db)));
+        let llm = Arc::new(StubLlm::default());
+        let tools = Arc::new(ToolRegistry::new());
+        let safety = Arc::new(SafetyLayer::new(&SafetyConfig {
+            max_output_length: 100_000,
+            injection_check_enabled: true,
+        }));
+        let (notify_tx, _notify_rx) = tokio::sync::mpsc::channel(1);
+        let engine = Arc::new(RoutineEngine::new(
+            RoutineConfig::default(),
+            Arc::clone(&db),
+            llm,
+            workspace,
+            notify_tx,
+            None,
+            Arc::clone(&tools),
+            safety,
+        ));
+
+        let before = tools.count();
+        tools.register_routine_tools(Arc::clone(&db), engine);
+
+        let registered = [
+            "routine_create",
+            "routine_list",
+            "routine_update",
+            "routine_delete",
+            "routine_fire",
+            "routine_history",
+            "event_emit",
+        ];
+        assert_eq!(tools.count() - before, registered.len());
+        for name in registered {
+            assert!(tools.has(name).await, "{name} should be registered");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
